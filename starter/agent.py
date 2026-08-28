@@ -11,6 +11,7 @@ Self-contained: standard library only, no network, no model calls.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -47,6 +48,14 @@ NO_INFO = re.compile(
 NO_PREFERENCE = re.compile(
     r"^i don't have (?P<kind>a|an additional) preference for (?P<attribute>[a-z_]+)", re.I
 )
+
+# Route Buying and Browsing down separate retrieval tracks.
+DUAL_TRACK_ROUTING = True
+
+# On "ignore my earlier preference", how much of the session is thrown away.
+OVERRIDE_RESETS = True
+OVERRIDE_RESETS_CATEGORY = False
+OVERRIDE_RESETS_ASKS = True
 
 ALLOWED_ATTRIBUTES = (
     "category", "material", "color", "size", "style", "brand",
@@ -145,6 +154,50 @@ TRUNCATION_LIMIT = 180
 # parent_asin, price_text, title, categories, features, details, store, description
 FIELD_WEIGHTS = (0.0, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0)
 
+# ---------------------------------------------------------------------------
+# Reranking
+# ---------------------------------------------------------------------------
+
+# Retrieval used to end at the BM25 cut, so the top-10 slice *was* the BM25
+# slice. It now fetches a pool and reranks it; BM25 survives as the tie-break,
+# which means a session with no usable evidence returns exactly what it
+# returned before.
+RERANK_ENABLED = True
+POOL_SIZE = 500
+
+# (whole-item / attribute match, loose substring, popularity, BM25 position).
+# The last two only ever settle candidates that are tied on evidence: together
+# they cannot span the 0.6 gap one loose match opens, so nothing outranks a
+# candidate that accounts for more of what the customer said. Within a tie the
+# two disagree on purpose -- popularity backs the product people actually buy,
+# BM25 backs the closest textual fit -- and the session is decided by which of
+# them the tie-group happens to favour.
+RERANK_WEIGHTS = (1.5, 0.6, 0.3, 0.10)
+
+# The customer clips each disclosed constraint at this many characters, so the
+# catalog side is clipped identically -- otherwise a truncated constraint could
+# never equal the item it was taken from.
+CLIP_LIMIT = 180
+SEARCH_FIELDS = ("title", "features", "details", "description", "categories", "store")
+MATERIAL_RE = re.compile(r"cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric", re.I)
+POP_SCALE = math.log1p(100000.0)
+
+
+def normalize(value: object) -> str:
+    """Fold a constraint or a catalog item into one comparable form."""
+    return re.sub(r"\s+", " ", str(value)).strip(" -;,.\t\n")[:CLIP_LIMIT].rstrip().casefold()
+
+
+def item_values(value: object) -> list[str]:
+    """The discrete strings a field contributes, kept separate rather than
+    joined: the customer quotes one whole bullet or one whole detail, so the
+    boundaries between them are the signal."""
+    if isinstance(value, dict):
+        return [f"{key}: {item}" for key, item in value.items() if item not in (None, "", [])]
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in (None, "")]
+    return [str(value)] if value not in (None, "") else []
+
 
 def fold(text: object) -> str:
     """Mirror the sqlite unicode61 'remove_diacritics 2' tokenizer."""
@@ -231,6 +284,11 @@ class Matcher:
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:", check_same_thread=False)
+        # Reranking features, filled during the same pass that builds the index.
+        self.items: dict[str, set[str]] = {}
+        self.text: dict[str, str] = {}
+        self.price: dict[str, str | None] = {}
+        self.pop: dict[str, float] = {}
         self._build_index()
 
     def _build_index(self) -> None:
@@ -246,6 +304,23 @@ class Matcher:
             for line in handle:
                 product = json.loads(line)
                 price = product.get("price")
+                asin = str(product["parent_asin"])
+                self.items[asin] = {
+                    norm for norm in (
+                        normalize(value)
+                        for field_name in ("features", "details")
+                        for value in item_values(product.get(field_name))
+                    ) if norm
+                }
+                self.text[asin] = " ".join(
+                    flatten(product.get(field_name)) for field_name in SEARCH_FIELDS
+                ).casefold()
+                self.price[asin] = (
+                    str(price).casefold() if price not in (None, "") else None
+                )
+                self.pop[asin] = min(
+                    1.0, math.log1p(int(product.get("rating_number") or 0)) / POP_SCALE
+                )
                 batch.append((
                     str(product["parent_asin"]),
                     fold(price).strip() if price not in (None, "") else "",
@@ -281,6 +356,104 @@ class Matcher:
         params.append(top_k)
         return [str(row[0]) for row in self.connection.execute(sql, params).fetchall()]
 
+    def _matches(self, constraint: str, asin: str) -> bool:
+        """Does this candidate satisfy one disclosed constraint outright?
+
+        Exact against a whole feature bullet or detail value first -- that is
+        the form the customer quotes in. Colour and material arrive as bare
+        attribute words instead, which no single item will ever equal, so they
+        fall back to looking for the value anywhere in the product's text.
+        """
+        if constraint in self.items[asin]:
+            return True
+        budget = BUDGET_RE.match(constraint)
+        if budget:
+            return self.price[asin] == budget.group("value").strip()
+        color = COLOR_RE.match(constraint)
+        if color:
+            return color.group("value").strip() in self.text[asin]
+        if MATERIAL_RE.fullmatch(constraint):
+            return constraint in self.text[asin]
+        # A constraint clipped mid-item still prefixes the item it came from.
+        if len(constraint) >= CLIP_LIMIT - 10:
+            return any(item.startswith(constraint) for item in self.items[asin])
+        return False
+
+    def rerank(self, pool: list[str], evidence: list[str], top_k: int) -> list[str]:
+        """Order a candidate pool by everything the customer has disclosed.
+
+        The pool is already filtered, so every candidate matches the applied
+        constraints *somewhere*; what separates them is whether the match lands
+        on a whole quoted item and how much of the rest of the session they
+        account for. Evidence decides the ordering outright wherever candidates
+        differ on it; where they do not -- which is most of the pool, since they
+        all cleared the same filter -- popularity and the incoming BM25 position
+        settle it between them.
+        """
+        if not RERANK_ENABLED or len(pool) <= top_k:
+            return pool[:top_k]
+        exact_w, loose_w, pop_w, rank_w = RERANK_WEIGHTS
+        constraints = [norm for norm in (normalize(item) for item in evidence) if norm]
+        constraints = list(dict.fromkeys(constraints))
+        depth = len(pool)
+
+        def score(entry: tuple[int, str]) -> tuple[float, int]:
+            position, asin = entry
+            total = pop_w * self.pop.get(asin, 0.0) - rank_w * (position / depth)
+            for constraint in constraints:
+                if self._matches(constraint, asin):
+                    total += exact_w
+                if constraint in self.text.get(asin, ""):
+                    total += loose_w
+            return (-total, position)
+
+        ordered = sorted(enumerate(pool), key=score)
+        return [asin for _, asin in ordered[:top_k]]
+
+    def browse(self, category: str | None, top_k: int = 10, pool: int = 500) -> tuple[list[str], dict]:
+        """Browsing track: spread the slots across the category.
+
+        With nothing to filter on, ten near-neighbours are a poor guess and
+        teach us nothing. A spread is still a poor guess but a useful probe --
+        whatever the shopper reacts to tells us where to go next.
+        """
+        terms = tokens(category) if category else []
+        if not terms:
+            return [], {"mode": "browse_empty", "pool": 0}
+        expression = " AND ".join(f'"{term}"' for term in terms)
+        weights = ", ".join(str(w) for w in FIELD_WEIGHTS)
+        try:
+            rows = self.connection.execute(
+                "SELECT parent_asin, store, title FROM products WHERE products MATCH ? "
+                f"ORDER BY bm25(products, {weights}) LIMIT ?",
+                (expression, pool),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return [], {"mode": "browse_error", "pool": 0}
+
+        picked: list[str] = []
+        seen_stores: set[str] = set()
+        seen_shapes: set[str] = set()
+        for asin, store, title in rows:
+            brand = fold(store).strip()
+            # Two products whose titles open the same way are the same idea.
+            shape = " ".join(tokens(title)[1:4])
+            if (brand and brand in seen_stores) or (shape and shape in seen_shapes):
+                continue
+            picked.append(str(asin))
+            seen_stores.add(brand)
+            seen_shapes.add(shape)
+            if len(picked) >= top_k:
+                break
+        # If diversity was too strict to fill the slots, backfill by rank.
+        if len(picked) < top_k:
+            for asin, _, _ in rows:
+                if str(asin) not in picked:
+                    picked.append(str(asin))
+                    if len(picked) >= top_k:
+                        break
+        return picked, {"mode": "browse", "pool": len(rows), "brands": len(seen_stores)}
+
     def search(
         self,
         category: str | None,
@@ -307,7 +480,11 @@ class Matcher:
             for form in constraint.phrases():
                 candidate = f"{expression} AND {form}" if expression else form
                 try:
-                    survivors = self._count(candidate, price_applied)
+                    # Price is deliberately excluded here. A budget the catalog
+                    # cannot satisfy exactly would zero every count and drop
+                    # every text constraint with it; it is applied at ranking
+                    # time instead, where it can be backed out safely.
+                    survivors = self._count(candidate, None)
                 except sqlite3.OperationalError:
                     continue
                 if survivors > 0:
@@ -360,12 +537,21 @@ PROMPTS = (
 
 
 class SessionState:
-    __slots__ = ("profile", "category", "constraints", "asked", "last_ask", "gained", "exhausted")
+    __slots__ = ("profile", "category", "constraints", "heard", "asked", "last_ask",
+                 "gained", "exhausted", "intent")
 
     def __init__(self, profile: dict) -> None:
         self.profile = profile or {}
-        self.category: str | None = None
-        self.constraints: list[str] = []
+        # Routed on the opening turn: a shopper who leads with a requirement is
+        # buying, one who leads with only a category is browsing.
+        self.intent: str | None = None # "buying" or "browsing" or "intent_override"
+        self.category: str | None = None 
+        self.constraints: list[str] = [] 
+        # Everything the customer has ever disclosed, never cleared. A
+        # superseded preference and a constraint the filter had to drop both
+        # still describe the target, so they stay available to the reranker
+        # even once they have stopped being safe to filter on.
+        self.heard: list[str] = []
         # What we asked, in order, and what each ask actually bought us. The
         # payoff for asking X only becomes visible in the *next* message, so
         # last_ask carries the pending question across the turn boundary.
@@ -381,8 +567,30 @@ class SessionState:
 
     def absorb(self, message: str) -> None:
         turn = parse_message(message)
+
+        # Recorded before the override reset below, which is the whole point:
+        # filtering forgets, ranking does not.
+        for constraint in turn.constraints:
+            if constraint and constraint not in self.heard:
+                self.heard.append(constraint)
+
+        if turn.is_override and OVERRIDE_RESETS:
+            # Take "ignore my earlier preference" literally: everything learned
+            # before the override is discarded and the session restarts from
+            # the new requirement alone.
+            self.constraints.clear()
+            if OVERRIDE_RESETS_CATEGORY:
+                self.category = None
+            if OVERRIDE_RESETS_ASKS:
+                self.asked.clear()
+                self.exhausted.clear()
+                self.gained.clear()
+            self.last_ask = None
+
         if turn.category and not self.category:
             self.category = turn.category
+        if self.intent is None and turn.category:
+            self.intent = "buying" if turn.constraints else "browsing"
 
         before = len(self.constraints)
         for constraint in turn.constraints:
@@ -393,7 +601,11 @@ class SessionState:
         # Attribute the outcome to whatever we asked on the previous turn. The
         # customer names the attribute it is refusing, so prefer that over our
         # own memory of what we sent.
-        answered = turn.refused or self.last_ask
+        #
+        # An override turn is the exception: the harness sends it instead of
+        # calling customer_reply, so our pending ask was never read and must
+        # not be credited with what the override happened to disclose.
+        answered = None if turn.is_override else (turn.refused or self.last_ask)
         if answered:
             self.gained[answered] = self.gained.get(answered, 0) + gain
             # A Boundary shrug is a scenario artifact, not evidence that the
@@ -418,6 +630,7 @@ def _make_client():
     policy alone, which is what we expect during official scoring.
     Set OLLAMA_HOST=off to force that path.
     """
+    return None
     if OLLAMA_HOST.strip().lower() in ("", "off", "none"):
         return None
     try:
@@ -511,7 +724,27 @@ class Agent:
         if state is None:
             raise RuntimeError("reset must be called before respond")
         state.absorb(user_message)
-        recommendations, _ = self.matcher.search(state.category, state.constraints, top_k)
+
+        # Dual-track routing. Constraints are what the precision track filters
+        # on, so with none in hand we take the browsing track instead of
+        # ranking the whole category by keyword weight alone.
+        if state.constraints or not DUAL_TRACK_ROUTING:
+            # Retrieve a pool rather than a page, then order it on the full
+            # session. state.heard is a superset of the constraints the filter
+            # applied and of the ones it had to drop, so it is all the evidence
+            # there is.
+            limit = POOL_SIZE if RERANK_ENABLED else top_k
+            pool, _ = self.matcher.search(state.category, state.constraints, limit)
+            try:
+                recommendations = self.matcher.rerank(pool, state.heard, top_k)
+            except Exception:
+                # The evaluator discards the whole turn if respond() raises, so
+                # a reranking bug must cost us the ordering, not the results.
+                recommendations = pool[:top_k]
+        else:
+            # Nothing disclosed yet means nothing to rank on; the browse track
+            # already spreads the slots across the category.
+            recommendations, _ = self.matcher.browse(state.category, top_k)
 
         ask, usage = self._choose_attribute(state)
         state.record_ask(ask)

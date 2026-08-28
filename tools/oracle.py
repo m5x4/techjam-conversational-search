@@ -162,7 +162,7 @@ def trace_session(sample, products, corpus, categories, all_ids, driver):
     }
 
 
-def render(report, products, corpus, limit_turns=6):
+def render(report, products, corpus, limit_turns=10):
     lines = []
     lines.append(f"=== {report['sample_id']}  [{report['scenario']}]  target={report['target']}")
     title = norm(products[report["target"]].get("title"))[:88]
@@ -179,7 +179,7 @@ def render(report, products, corpus, limit_turns=6):
     lines.append(header + "heard")
     for row in report["turns"][:limit_turns]:
         heard = norm(row["heard"])
-        heard = heard if len(heard) <= 52 else heard[:49] + "..."
+        # heard = heard if len(heard) <= 52 else heard[:49] + "..."
         line = (
             f"    {row['turn']:<5}{str(row['ask']):<10}{len(row['known']):<7}{row['candidates']:>9}"
             f"  {'yes' if row['target_survives'] else 'NO':<6}"
