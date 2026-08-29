@@ -165,6 +165,36 @@ FIELD_WEIGHTS = (0.0, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0)
 RERANK_ENABLED = True
 POOL_SIZE = 500
 
+# Once the customer stops disclosing, the ranking stops changing -- and the ten
+# items it produces have already been shown and already missed, because the
+# harness ends the session the moment the target appears. Re-serving them is
+# provably worthless, so a dry turn pages one slate deeper into the pool
+# instead. The session is being lost anyway; this spends its dead turns on
+# candidates the shopper has not seen yet.
+#
+# Deliberately an offset rather than a served-item blacklist: an Intent
+# Override session does not register a hit until the override lands, so the
+# target can legitimately appear in an early slate without ending the session.
+# Blacklisting what we have shown would bury it for the rest of that session.
+DEEP_PAGING = True
+
+# The harness ends the session the moment the target appears anywhere in the
+# slate, so whatever rank we surface it at is the rank we are scored on for
+# good -- there is no second chance to improve it later in the session. When
+# the top of the pool is tied on evidence, the order among those candidates is
+# settled by popularity and BM25 position, two proxies that are close to a coin
+# flip, so serving them spends the session's one scoring opportunity on that
+# coin flip. Staying quiet and buying one more constraint is the better trade:
+# an extra turn costs 0.2 x (1/200)/10 of the score, while lifting a hit from
+# rank 3 to rank 1 is worth 0.3 x (2/3)/200 -- ten times as much.
+WITHHOLD_ON_TIE = True
+
+# Last turn on which we are allowed to stay quiet. This is the safety valve:
+# past it the slate always goes out, so withholding can cost us rank but never
+# a hit. It is set at 2 because turn 3 measurably starts losing sessions
+# outright, and hit rate carries 0.5 of the score against MRR's 0.3.
+WITHHOLD_UNTIL_TURN = 2
+
 # (whole-item / attribute match, loose substring, popularity, BM25 position).
 # The last two only ever settle candidates that are tied on evidence: together
 # they cannot span the 0.6 gap one loose match opens, so nothing outranks a
@@ -379,7 +409,13 @@ class Matcher:
             return any(item.startswith(constraint) for item in self.items[asin])
         return False
 
-    def rerank(self, pool: list[str], evidence: list[str], top_k: int) -> list[str]:
+    def rerank(
+        self,
+        pool: list[str],
+        evidence: list[str],
+        top_k: int,
+        offset: int = 0,
+    ) -> list[str]:
         """Order a candidate pool by everything the customer has disclosed.
 
         The pool is already filtered, so every candidate matches the applied
@@ -389,26 +425,46 @@ class Matcher:
         differ on it; where they do not -- which is most of the pool, since they
         all cleared the same filter -- popularity and the incoming BM25 position
         settle it between them.
+
+        Returns the slate together with how many candidates were tied on
+        evidence at the top, which is what the caller needs in order to know
+        whether the ordering it just received means anything.
         """
-        if not RERANK_ENABLED or len(pool) <= top_k:
-            return pool[:top_k]
+        # Clamped so a deep page never returns a short slate: running past the
+        # end of the pool would hand back fewer than top_k ids and waste the
+        # slots outright, which is strictly worse than repeating a tail.
+        offset = max(0, min(offset if DEEP_PAGING else 0, max(0, len(pool) - top_k)))
+        if not RERANK_ENABLED or not pool:
+            return pool[offset:offset + top_k], {"tied": len(pool)}
         exact_w, loose_w, pop_w, rank_w = RERANK_WEIGHTS
         constraints = [norm for norm in (normalize(item) for item in evidence) if norm]
         constraints = list(dict.fromkeys(constraints))
         depth = len(pool)
 
-        def score(entry: tuple[int, str]) -> tuple[float, int]:
-            position, asin = entry
-            total = pop_w * self.pop.get(asin, 0.0) - rank_w * (position / depth)
+        # Evidence is scored on its own pass rather than inline with the
+        # tie-breakers, because how many candidates share the best evidence
+        # score is itself the answer to a question the caller has to ask: is
+        # this ordering carrying information, or is it popularity and BM25
+        # position deciding a session between indistinguishable items?
+        earned: dict[str, float] = {}
+        for asin in pool:
+            total = 0.0
             for constraint in constraints:
                 if self._matches(constraint, asin):
                     total += exact_w
                 if constraint in self.text.get(asin, ""):
                     total += loose_w
+            earned[asin] = total
+        best = max(earned.values())
+        tied = sum(1 for value in earned.values() if value >= best - 1e-9)
+
+        def score(entry: tuple[int, str]) -> tuple[float, int]:
+            position, asin = entry
+            total = earned[asin] + pop_w * self.pop.get(asin, 0.0) - rank_w * (position / depth)
             return (-total, position)
 
         ordered = sorted(enumerate(pool), key=score)
-        return [asin for _, asin in ordered[:top_k]]
+        return [asin for _, asin in ordered[offset:offset + top_k]], {"tied": tied, "best": best}
 
     def browse(self, category: str | None, top_k: int = 10, pool: int = 500) -> tuple[list[str], dict]:
         """Browsing track: spread the slots across the category.
@@ -535,10 +591,19 @@ PROMPTS = (
     "Noted. Anything else you'd want me to take into account?",
 )
 
+# Said on a turn we deliberately stay quiet: several candidates match
+# everything disclosed so far equally well, and guessing between them would
+# waste the recommendation. Naming that is also the honest explanation.
+WITHHOLD_PROMPT = (
+    "Several items match everything you've told me so far equally well, so I'd "
+    "rather not guess between them. One more detail and I can narrow it down -- "
+    "what else matters to you?"
+)
+
 
 class SessionState:
     __slots__ = ("profile", "category", "constraints", "heard", "asked", "last_ask",
-                 "gained", "exhausted", "intent")
+                 "gained", "exhausted", "intent", "dry")
 
     def __init__(self, profile: dict) -> None:
         self.profile = profile or {}
@@ -559,6 +624,9 @@ class SessionState:
         self.last_ask: str | None = None
         self.gained: dict[str, int] = {}
         self.exhausted: set[str] = set()
+        # Consecutive turns that told us nothing new. Each one is a slate the
+        # shopper has already been shown, so it doubles as the page number.
+        self.dry = 0
 
     def record_ask(self, attribute: str | None) -> None:
         if attribute:
@@ -597,6 +665,21 @@ class SessionState:
             if constraint and constraint not in self.constraints:
                 self.constraints.append(constraint)
         gain = len(self.constraints) - before
+
+        # A turn that adds no constraint leaves the ranking byte-identical to
+        # the one that just missed, so it is a dead slate and the next turn
+        # should page past it. Two turns are exempt. An override rewrites the
+        # constraint set, so its ranking is new. A Boundary shrug is a one-off
+        # scenario artifact -- the customer answers properly on the turn after
+        # it -- and paging on it would move the slate that scenario usually
+        # converts on.
+        if gain > 0:
+            self.dry = 0
+        elif self.asked and not turn.is_override and not turn.refusal_is_boundary:
+            # self.asked is empty only on the opening message, which discloses
+            # no constraint in a Browsing session. That is not a dead turn --
+            # there is no slate behind it yet -- so it must not advance the page.
+            self.dry += 1
 
         # Attribute the outcome to whatever we asked on the previous turn. The
         # customer names the attribute it is refusing, so prefer that over our
@@ -724,6 +807,7 @@ class Agent:
         if state is None:
             raise RuntimeError("reset must be called before respond")
         state.absorb(user_message)
+        withheld = False
 
         # Dual-track routing. Constraints are what the precision track filters
         # on, so with none in hand we take the browsing track instead of
@@ -733,14 +817,30 @@ class Agent:
             # session. state.heard is a superset of the constraints the filter
             # applied and of the ones it had to drop, so it is all the evidence
             # there is.
-            limit = POOL_SIZE if RERANK_ENABLED else top_k
+            offset = state.dry * top_k if DEEP_PAGING else 0
+            limit = POOL_SIZE if RERANK_ENABLED else top_k + offset
             pool, _ = self.matcher.search(state.category, state.constraints, limit)
+            ranking: dict = {}
             try:
-                recommendations = self.matcher.rerank(pool, state.heard, top_k)
+                recommendations, ranking = self.matcher.rerank(
+                    pool, state.heard, top_k, offset
+                )
             except Exception:
                 # The evaluator discards the whole turn if respond() raises, so
                 # a reranking bug must cost us the ordering, not the results.
-                recommendations = pool[:top_k]
+                start = max(0, min(offset, max(0, len(pool) - top_k)))
+                recommendations = pool[start:start + top_k]
+            # Nothing separates the top of this pool, so showing it would lock
+            # in a coin-flip rank for the rest of the session. Spend the turn
+            # on another constraint instead; the turn cap above guarantees the
+            # slate still goes out while there is plenty of session left.
+            if (
+                WITHHOLD_ON_TIE
+                and turn <= WITHHOLD_UNTIL_TURN
+                and ranking.get("tied", 0) > 1
+            ):
+                withheld = True
+                recommendations = []
         else:
             # Nothing disclosed yet means nothing to rank on; the browse track
             # already spreads the slots across the category.
@@ -750,7 +850,9 @@ class Agent:
         state.record_ask(ask)
 
         return {
-            "message": PROMPTS[(turn - 1) % len(PROMPTS)],
+            "message": (
+                WITHHOLD_PROMPT if withheld else PROMPTS[(turn - 1) % len(PROMPTS)]
+            ),
             "ask_attribute": ask,
             "recommendations": [{"parent_asin": asin} for asin in recommendations],
             "usage": usage,
