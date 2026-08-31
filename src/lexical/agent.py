@@ -1,7 +1,9 @@
-"""Multi-turn conversational-search agent -- submission entry point.
+"""Multi-turn conversational-search agent -- the lexical retrieval track.
 
-`Agent` is the exported interface (reset / respond). The implementation is
-split across sibling modules:
+One of the two implementations behind the scenario router in `agent.py`; the
+router hands this one every turn of an Intent-Override session. `Agent`
+(reset / respond) is the same interface the router and evaluator expect. The
+implementation is split across sibling modules:
 
     config.py           tuning constants (swept; see README)
     text_utils.py       tokenisation + normalisation helpers
@@ -12,7 +14,7 @@ split across sibling modules:
     catalog_index.py    BM25 (SQLite FTS5) + blob / field-value / popularity maps
 
 Strategy, tuning history and rejected experiments are written up in
-`starter/README.md`.
+`src/README.md`.
 
 Runtime overview:
   * ask_attribute emits "other" every turn until the simulator has nothing
@@ -100,9 +102,16 @@ class Agent:
         # only THIN_KEEP ids defers that weak hit one turn; retrieval is
         # monotonic so it re-enters at the same-or-better rank -- ~1 turn of
         # MTTC at worst, never a new miss. README: "Thin-signal guard".
+        # config.BOUNDARY_SLACK (README: "Combined v1+v2 features"): a
+        # Boundary-scenario "I don't have A preference for X" shrug discloses
+        # nothing and shifts that session one turn later, so each shrug buys
+        # the turn cap one more turn -- what the cap really bounds is the
+        # evidence behind the slate, not the clock. Default OFF -> the cap is
+        # exactly THIN_MAX_TURN.
+        thin_cap = THIN_MAX_TURN + (state.slack if BOUNDARY_SLACK else 0)
         if (
             THIN_ENABLE
-            and turn <= THIN_MAX_TURN
+            and turn <= thin_cap
             and not state.exhausted
             and len(state.phrase_constraints()) <= THIN_PHRASE_MAX
             and len(recommendations) > THIN_KEEP
@@ -210,7 +219,45 @@ class Agent:
             return []
 
         fused = self._rerank(state, pool)
+        # config.BROWSE_DIVERSITY (README: "Combined v1+v2 features"): a
+        # no-constraint Browsing turn has nothing to rank on, so ten
+        # near-neighbours all teach the same thing. Spread the head across
+        # distinct stores / title-shapes before _window slices it, so the
+        # slate probes different sub-types. Default OFF.
+        if (
+            BROWSE_DIVERSITY
+            and state.mode == "browsing"
+            and not state.active_constraints
+        ):
+            fused = self._diversify(fused, top_k)
         return self._window(state, fused, top_k)
+
+    def _diversify(self, fused: list[str], top_k: int) -> list[str]:
+        """Reorder `fused` so the first `top_k` cover distinct stores and
+        distinct title-shapes (first-after-brand 3 title tokens), skipped
+        duplicates appended behind them. Ported from agent_v2.py's browse
+        track. Never drops an id -- `_window` still gets the full list."""
+        picked: list[str] = []
+        deferred: list[str] = []
+        seen_store: set[str] = set()
+        seen_shape: set[str] = set()
+        for pid in fused:
+            brand = _norm(self.index.store.get(pid, ""))
+            shape = " ".join(_terms(self.index.title.get(pid, ""))[1:4])
+            if (brand and brand in seen_store) or (shape and shape in seen_shape):
+                deferred.append(pid)
+                continue
+            picked.append(pid)
+            if brand:
+                seen_store.add(brand)
+            if shape:
+                seen_shape.add(shape)
+            if len(picked) >= top_k:
+                break
+        result = picked + deferred
+        placed = set(result)
+        result.extend(pid for pid in fused if pid not in placed)
+        return result
 
     def _rerank(self, state: _SessionState, pool: list[str]) -> list[str]:
         """Single linear-scoring rerank of the BM25 / bucket `pool`.
@@ -297,6 +344,15 @@ class Agent:
             and prior_rating is not None
             and prior_rating < PRIOR_RATING_MAX
         )
+        # Ported from agent_v2.py (README: "Combined v1+v2 features"). Both
+        # are score-only additive terms -- evidence / tie-count untouched --
+        # and both are inert at their config default of 0.0.
+        #   POSITION_W: reward a disclosed constraint that lands on an early
+        #     feature/detail entry (the defining attribute) over one buried
+        #     deep (an incidental mention). 1 / (1 + earliest_entry_index).
+        #   VELOCITY_W: rating_number / listing-age, added ALONGSIDE POP_W.
+        use_position = POSITION_W > 0.0
+        use_velocity = VELOCITY_W > 0.0
 
         evidence: dict[str, float] = {}
         score: dict[str, float] = {}
@@ -317,6 +373,22 @@ class Agent:
                 if cr > 0.0:
                     divergence = min(abs(cr - prior_rating) / 2.0, 1.0)
                     score[pid] -= PRIOR_RATING_W * divergence
+            if use_position:
+                fpos = idx.field_pos.get(pid)
+                if fpos:
+                    earliest: int | None = None
+                    for c in constraints:
+                        i = fpos.get(c)
+                        if i is None:
+                            i = next(
+                                (j for k, j in fpos.items() if c in k), None
+                            )
+                        if i is not None and (earliest is None or i < earliest):
+                            earliest = i
+                    if earliest is not None:
+                        score[pid] += POSITION_W / (1.0 + earliest)
+            if use_velocity:
+                score[pid] += VELOCITY_W * idx.velocity.get(pid, 0.0)
 
         best_ev = max(evidence.values(), default=0.0)
         state.last_rerank_tie_count = sum(

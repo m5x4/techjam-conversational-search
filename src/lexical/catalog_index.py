@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
@@ -37,9 +38,29 @@ def _seg_index(value: str) -> str:
     return value if value.isascii() else " ".join(_segment(value))
 
 
+# Ratings-velocity constants (ported verbatim from the standalone
+# agent_v2.py). `Date First Available` is free text; pull a 4-digit year out
+# of it, clamp the age to [1, NOW-FLOOR], and normalise log1p(count / age) by
+# the same 100k scale the popularity prior uses. Consumed only when
+# config.VELOCITY_W > 0 -- the map itself is always built.
+_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+_VELOCITY_NOW = 2024
+_VELOCITY_FLOOR_YEAR = 2008
+_POP_SCALE = math.log1p(100000.0)
+
+
+def listed_year(details: object) -> int | None:
+    """The year off ``details["Date First Available"]`` (free text), or None."""
+    if not isinstance(details, dict):
+        return None
+    stamp = details.get("Date First Available")
+    found = _YEAR_RE.search(str(stamp)) if stamp else None
+    return int(found.group(0)) if found else None
+
+
 def _bm25_expr() -> str:
     """`bm25(products, w0, w1, ...)` built from config.BM25_COLUMN_WEIGHTS at
-    call time -- so a sweep that reassigns starter.config.BM25_COLUMN_WEIGHTS
+    call time -- so a sweep that reassigns src.lexical.config.BM25_COLUMN_WEIGHTS
     is picked up on the next query without an index rebuild."""
     weights = ", ".join(repr(float(w)) for w in config.BM25_COLUMN_WEIGHTS)
     return f"bm25(products, {weights})"
@@ -64,6 +85,16 @@ class _CatalogIndex:
         # each _norm-folded. The EXACT whole-field match term of Agent._rerank
         # tests constraint-equality against this set.
         self.field_values: dict[str, set[str]] = {}
+        # Same discrete values, but mapped to their first-occurrence index in
+        # the item's own features-then-details order. Backs the optional
+        # match-prominence term (config.POSITION_W); always built.
+        self.field_pos: dict[str, dict[str, int]] = {}
+        # rating_number / listing-age, normalised. Backs config.VELOCITY_W.
+        self.velocity: dict[str, float] = {}
+        # Readable store / title per product (only otherwise in FTS5 columns),
+        # for the optional browse-diversity spread (config.BROWSE_DIVERSITY).
+        self.store: dict[str, str] = {}
+        self.title: dict[str, str] = {}
         # coarse_category(...) -> parent_asin list. Populated by _build(),
         # wrapped in a BucketIndex below.
         self.coarse_category_by_id: dict[str, str] = {}
@@ -138,20 +169,36 @@ class _CatalogIndex:
                     )
                 )
                 self.category_text[parent_asin] = categories
+                self.store[parent_asin] = store
+                self.title[parent_asin] = title
                 doc_text = " ".join(
                     (title, categories, features, details, store, description)
                 )
                 self.blob[parent_asin] = doc_text.lower()
-                self.field_values[parent_asin] = {
-                    norm
-                    for norm in (
-                        _norm(v)
-                        for fld in ("features", "details")
-                        for v in _field_value_strings(product.get(fld))
-                    )
-                    if norm
-                }
+                # One pass over the discrete feature/detail values: the set
+                # (whole-value equality test) and the position map (index of
+                # the first entry carrying each value) are the same data.
+                pos: dict[str, int] = {}
+                _entry = 0
+                for fld in ("features", "details"):
+                    for v in _field_value_strings(product.get(fld)):
+                        norm = _norm(v)
+                        if not norm:
+                            continue
+                        pos.setdefault(norm, _entry)
+                        _entry += 1
+                self.field_values[parent_asin] = set(pos)
+                self.field_pos[parent_asin] = pos
                 self._absorb_numeric(parent_asin, product)
+                year = listed_year(product.get("details"))
+                age = max(
+                    1, _VELOCITY_NOW - (year if year else _VELOCITY_FLOOR_YEAR)
+                )
+                self.velocity[parent_asin] = min(
+                    1.0,
+                    math.log1p(self.rating_count.get(parent_asin, 0) / age)
+                    / _POP_SCALE,
+                )
                 if len(batch) >= 1000:
                     cursor.executemany(
                         "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch

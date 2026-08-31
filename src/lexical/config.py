@@ -1,16 +1,16 @@
 """Tuning constants for the conversational-search agent.
 
 Every value here was swept against the 200-sample public set. The rationale,
-sweep grids and rejected alternatives are written up in ``starter/README.md``
+sweep grids and rejected alternatives are written up in ``src/README.md``
 (sections referenced from the inline notes below) rather than repeated here.
 
 The sweep scripts under ``scripts/`` mutate these names on the imported
-``starter.agent`` module at runtime (``agent_mod.THIN_KEEP = ...``); the
+``src.lexical.agent`` module at runtime (``agent_mod.THIN_KEEP = ...``); the
 agent re-exports them with ``from .config import *`` and reads them as bare
-module globals, so a reassignment on ``starter.agent`` is picked up on the
-next call. Constants consumed inside ``catalog_index.py`` (the FTS5 term
+module globals, so a reassignment on ``src.lexical.agent`` is picked up on
+the next call. Constants consumed inside ``catalog_index.py`` (the FTS5 term
 caps) are read from this module directly -- point ``sweep_weight.py`` at
-``starter.config`` to sweep those.
+``src.lexical.config`` to sweep those.
 """
 
 from __future__ import annotations
@@ -41,6 +41,10 @@ __all__ = [
     "PRICE_TOL",
     "PRIOR_RATING_W",
     "PRIOR_RATING_MAX",
+    "POSITION_W",
+    "VELOCITY_W",
+    "BOUNDARY_SLACK",
+    "BROWSE_DIVERSITY",
 ]
 
 # Candidates pulled from FTS5 before the rerank, on the unresolved
@@ -172,5 +176,78 @@ PRICE_TOL = 0.01
 # user whose target is itself 5.0-rated takes zero penalty while the mid-rated
 # decoys above it are demoted, so the shipped 5.1 keeps the gate open for
 # every rating. README: "User-profile rating affinity".
-PRIOR_RATING_W = 0.15
+#
+# REVERTED to 0.0 (2026-09-01). The W = 0.15 gain was measured only on the
+# 200-sample public set (+0.00122 composite, +0.0001 on its 50-session val
+# half -- both below the local evaluator's ~0.001 cross-run drift). On the
+# held-out 800-session dev_set the term is net-NEGATIVE: with it OFF the
+# composite is 0.95093 -> 0.95157 and MRR 0.93317 -> 0.93524, and browsing /
+# boundary MRR both improve (only intent_override dips 0.003). It was fit to
+# public-set noise. Code path kept (inert at 0.0) for a private evaluator
+# that might phrase the profile with more usable variance.
+PRIOR_RATING_W = 0.0
 PRIOR_RATING_MAX = 5.1
+
+# --- Ported from the standalone agent_v2.py (README: "Combined v1+v2
+# features"). Four candidate levers, each gated here and inert at its no-op
+# default. The backing per-product data (field_pos map, velocity map,
+# store/title maps) is built unconditionally in catalog_index.py -- only the
+# weight / flag gates behaviour, so scripts/sweep_weight.py moves it without
+# an index rebuild. Validated on the held-out 800-session dev_set per the
+# post-PRIOR_RATING_W rule ("Report new levers on dev_set, not the 200-set").
+# Verdict: F1 ships; F2 / F3 / F4 rejected (kept inert for a private
+# evaluator, same as CONF_GATE and PRIOR_RATING_W).
+
+# F1 -- match-prominence term. A disclosed constraint that lands on the
+# item's FIRST feature/detail entry is the defining attribute; one buried
+# deep ("...ships with a nylon carry bag") is incidental. Score-only, added
+# to _rerank as POSITION_W * 1/(1 + earliest_entry_index). This is a signal
+# outside the disclosed text's mere presence/absence -- the one kind
+# README's "six-session data-ambiguity dead end" leaves open. 0.0 disables.
+#
+# SHIPPED at 0.2. Public sweep {0.1 .. 0.5}: interior peak at 0.2 (composite
+# +0.0002, MTTC only) -- noise-band on its own. But it GENERALISES: on the
+# held-out dev_set (800) POSITION_W = 0.2 gives composite 0.951571 ->
+# 0.952421 (+0.00085), MRR 0.935237 -> 0.937320 (+0.0021, a real rank gain
+# not just MTTC), hit-rate flat, 22 sessions moved, 0 regressions; buying
+# MRR +0.0036, intent_override +0.0042, boundary / browsing untouched.
+# Bigger on held-out than on the tuning set -- the opposite of the
+# PRIOR_RATING_W failure. README: "Combined v1+v2 features".
+POSITION_W = 0.2
+
+# F2 -- ratings velocity: rating_number normalised by listing age, added
+# alongside (not replacing) the popularity term as VELOCITY_W * velocity.
+#
+# REJECTED (kept inert at 0.0). Public looked like a win -- fine sweep
+# {0.3 .. 0.6} showed a plateau at composite 0.970889 (+0.0006 vs the
+# then-baseline). It did NOT survive the dev_set: at 0.5, composite
+# 0.951571 -> 0.951052 (-0.0005), MRR -0.0021, and 16 rank/hit regressions
+# incl. dev_0323 dropping a rank-7 hit to a miss; boundary / browsing /
+# buying MRR all fall (only intent_override rises). The public plateau was
+# fit to 200-set noise -- same story as PRIOR_RATING_W. Code path kept for a
+# private evaluator whose age/volume relationship differs.
+VELOCITY_W = 0.0
+
+# F3 -- boundary-shrug slack. "I don't have A preference for X" is a one-off
+# Boundary-scenario shrug that costs a turn; "AN ADDITIONAL preference" is
+# genuine exhaustion. When True each shrug pushes the THIN turn cap back one.
+#
+# REJECTED (kept inert at False). No-op on the public set (all 10 boundary
+# sessions already rank-1). On dev_set (40 boundary sessions) it is still a
+# no-op-to-slightly-negative: composite -0.00005, 2 sessions converge one
+# turn later, MRR flat. agent.py's THIN guard already caps at turn 3, which
+# covers the boundary MTTC of ~2.6, so the extra turn of slack buys nothing
+# (agent_v2's exposure gate, which this was ported from, capped at turn 2).
+# Split-refusal parsing (message_parsing.RE_NO_PREF_*) is kept -- it is
+# strictly more correct -- and state.slack is still counted, just unused.
+BOUNDARY_SLACK = False
+
+# F4 -- browse-track diversity spread: on a no-constraint Browsing turn,
+# dedupe the reranked head by store/brand and title-shape before the top_k
+# slice.
+#
+# REJECTED (kept inert at False). Completely dead on both sets: 0 sessions
+# move. The THIN guard trims Browsing turns 1-2 to a single id, and by
+# turn 3 constraints have landed so `not state.active_constraints` is false
+# and the branch never fires on a scored turn.
+BROWSE_DIVERSITY = False

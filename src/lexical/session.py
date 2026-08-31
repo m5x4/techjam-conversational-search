@@ -14,6 +14,8 @@ from .message_parsing import (
     RE_CATEGORY,
     RE_GENERIC_REBUFF,
     RE_KEY_REQUIREMENT,
+    RE_NO_PREF_BOUNDARY,
+    RE_NO_PREF_EXHAUSTED,
     RE_NO_PREFERENCE,
     RE_OPENER_FILLER,
     RE_OPENER_TAIL,
@@ -59,6 +61,7 @@ class _SessionState:
         "budget_amount",  # float parsed from a "$NN" budget reveal, else None
         "budget_op",  # "<" | ">" | "~" operator for budget_amount, else None
         "prior_rating",  # user_profile.average_prior_rating (1..5), set by Agent.reset; else None
+        "slack",  # count of Boundary "a preference for X" shrugs; extends the THIN cap iff config.BOUNDARY_SLACK
 
         "stable_top",  # top_k list first shown on the turn exhaustion was reached
         "rotation_cursor",  # offset into fused[top_k:] for post-exhaustion rotation
@@ -85,6 +88,7 @@ class _SessionState:
         self.budget_amount: float | None = None
         self.budget_op: str | None = None
         self.prior_rating: float | None = None
+        self.slack = 0
         self.stable_top: list[str] | None = None
         self.rotation_cursor = 0
         self.exhausted_since_turn: int | None = None
@@ -236,12 +240,17 @@ class _SessionState:
         if RE_NO_PREFERENCE.search(user_message):
             # Either a boundary "use your judgment" reply, or "I don't have an
             # additional preference for other": either way, no new constraint.
-            # The "no additional preference" dead-end for our (always-"other")
-            # ask means everything has been disclosed.
-            if "additional preference" in user_message.lower():
+            if RE_NO_PREF_EXHAUSTED.search(user_message):
+                # The "no additional preference" dead-end for our (always-
+                # "other") ask means everything has been disclosed.
                 self.exhausted = True
                 if self.exhausted_since_turn is None:
                     self.exhausted_since_turn = self.turn
+            elif RE_NO_PREF_BOUNDARY.search(user_message):
+                # One-off Boundary shrug: discloses nothing about the named
+                # attribute and just costs a turn. Counted here always;
+                # only consumed downstream when config.BOUNDARY_SLACK is on.
+                self.slack += 1
             return
 
         if RE_GENERIC_REBUFF.search(user_message):
@@ -268,6 +277,7 @@ class _SessionState:
             "budget_amount": self.budget_amount,
             "budget_op": self.budget_op,
             "prior_rating": self.prior_rating,
+            "slack": self.slack,
             "override_seen": self.override_seen,
             "exhausted": self.exhausted,
             "last_ask_attribute": self.last_ask_attribute,

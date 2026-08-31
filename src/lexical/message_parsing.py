@@ -26,6 +26,18 @@ RE_OVERRIDE = re.compile(
 RE_NO_PREFERENCE = re.compile(
     r"I don't have (?:an additional preference|a preference)", re.IGNORECASE
 )
+# The two refusals read alike but mean different things. "an additional
+# preference for X" = attribute X is genuinely used up (true exhaustion).
+# "a preference for X" (no "additional") = a one-off Boundary-scenario shrug
+# that says nothing about X and just costs the session a turn. Order matters:
+# test EXHAUSTED first, since its text also satisfies the BOUNDARY pattern's
+# prefix. README: "Combined v1+v2 features" (F3, boundary slack).
+RE_NO_PREF_EXHAUSTED = re.compile(
+    r"I don't have an additional preference", re.IGNORECASE
+)
+RE_NO_PREF_BOUNDARY = re.compile(
+    r"I don't have a preference", re.IGNORECASE
+)
 RE_GENERIC_REBUFF = re.compile(r"not quite right yet", re.IGNORECASE)
 
 # Turn-1 opener shape: "I'm looking for <category>.<tail>". The tail is empty
