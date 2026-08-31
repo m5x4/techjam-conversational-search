@@ -20,6 +20,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from starter.llm_rerank import LLMReranker
+
 
 # ---------------------------------------------------------------------------
 # Reading the customer
@@ -77,7 +79,7 @@ BUCKET_KEEPS_CATEGORY_TERMS = True
 # bare word like "cotton", filtering on it alone leaves a pool the target does
 # not survive into, and no amount of reranking can recover an item retrieval
 # never returned.
-OVERRIDE_RESETS = True
+OVERRIDE_RESETS = False
 OVERRIDE_RESETS_CATEGORY = False
 OVERRIDE_RESETS_ASKS = False
 
@@ -257,6 +259,41 @@ POSITION_BREAKS_TIES = False
 EXPOSURE_ENABLED = True
 EXPOSURE_UNTIL_TURN = 2
 EXPOSURE_WIDTH = 1
+
+# ---------------------------------------------------------------------------
+# LLM reranking
+# ---------------------------------------------------------------------------
+
+# A model pass over the ten candidates the linear reranker produced, before the
+# exposure gate trims them. See starter/llm_rerank.py for what it is allowed to
+# do (reorder, nothing else) and how it fails (back to this ordering, always).
+#
+# Off by default. Official scoring may run without network access, and the
+# deterministic pipeline is what the recorded score was measured on; turning
+# this on is an opt-in that has to earn its place against that baseline.
+LLM_RERANK_ENABLED = os.environ.get("LLM_RERANK", "").strip().lower() in ("1", "true", "on", "yes")
+
+# Which turns get a model call.
+#
+# Deliberately the exposure turns and no further. On turns 1-2 the slate is
+# trimmed to a single item, so the whole session's score turns on which
+# candidate the reranker put first -- that is where a better ordering is worth
+# the most and where the linear model is weakest, because one disclosed
+# constraint leaves most of the pool tied. By turn 3 the full slate goes out and
+# a reorder can only move the target between ranks that already score, which is
+# worth a fraction as much per call.
+LLM_RERANK_UNTIL_TURN = 2
+
+# Only call when the top of the slate is actually contested. A slate whose best
+# candidate is uniquely best on evidence is not a coin flip and the model has
+# nothing to add; skipping those is most of the token saving, and it also keeps
+# the model away from the decisions the linear reranker already gets right.
+LLM_RERANK_ONLY_WHEN_TIED = True
+
+# How much of each candidate the prompt carries.
+LLM_TITLE_CHARS = 120
+LLM_FEATURE_CHARS = 100
+LLM_MAX_FEATURES = 5
 
 # (whole-item / attribute match, loose substring, popularity, BM25 position).
 # The last two only ever settle candidates that are tied on evidence: together
@@ -471,6 +508,10 @@ class Matcher:
         # Reranking features, filled during the same pass that builds the index.
         self.items: dict[str, dict[str, int]] = {}
         self.text: dict[str, str] = {}
+        # (title, store) per item -- the two fields the LLM reranker needs that
+        # nothing else on this object keeps in readable form. Features come off
+        # `items`, whose keys are already the item's own bullets in order.
+        self.card: dict[str, tuple[str, str]] = {}
         self.price: dict[str, str | None] = {}
         self.pop: dict[str, float] = {}
         self.velocity: dict[str, float] = {}
@@ -521,6 +562,9 @@ class Matcher:
                         placed[alias] = slot
                         aliased.append(alias)
                 self.items[asin] = placed
+                self.card[asin] = (
+                    str(product.get("title") or ""), str(product.get("store") or "")
+                )
                 alias_text = " " + " ".join(aliased) if aliased else ""
                 self.text[asin] = (" ".join(
                     flatten(product.get(field_name)) for field_name in SEARCH_FIELDS
@@ -688,6 +732,36 @@ class Matcher:
                 -(position / depth),
             ))
         return rows
+
+    def cards(self, asins: list[str]) -> list[dict]:
+        """Readable descriptions of candidates, for the LLM reranker prompt.
+
+        Built from what the index already holds rather than from the catalog
+        file, so this costs a dict lookup per candidate and no I/O. The feature
+        bullets come out of `items` in the item's own metadata order, which is
+        the order the manufacturer wrote them -- the defining material first,
+        the incidental ones after -- and that ordering is itself part of what
+        the model is being asked to judge.
+
+        The bullets arrive casefolded and clipped, because `items` stores them
+        in the form the constraint matcher compares against and keeping a
+        second raw copy would cost ~25MB to recover capitalisation the model
+        does not need.
+        """
+        out: list[dict] = []
+        for asin in asins:
+            title, store = self.card.get(asin, ("", ""))
+            features = [
+                value[:LLM_FEATURE_CHARS]
+                for value in list(self.items.get(asin, {}))[:LLM_MAX_FEATURES]
+            ]
+            out.append({
+                "asin": asin,
+                "title": title[:LLM_TITLE_CHARS],
+                "store": store,
+                "features": features,
+            })
+        return out
 
     def rerank(
         self,
@@ -1094,6 +1168,11 @@ class Agent:
         self.matcher = Matcher(catalog_path)
         self._sessions: dict[str, SessionState] = {}
         self._client = _make_client()
+        # Constructed once. When the model is off or unreachable this is a
+        # disabled object rather than None, so respond() has no second code
+        # path to keep in sync -- it calls the same method either way and gets
+        # the identity ordering back.
+        self._llm = LLMReranker(provider=None if LLM_RERANK_ENABLED else "off")
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         self._sessions[session_id] = SessionState(user_profile)
@@ -1208,6 +1287,23 @@ class Agent:
                 state.category, top_k, bucket=bucket
             )
 
+        # The model pass sits between ranking and trimming, which is the only
+        # place it can pay: on the exposure turns the slate is cut to one item,
+        # so reordering after the cut would reorder a list of length one.
+        llm_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        if self._llm.enabled and turn <= LLM_RERANK_UNTIL_TURN and len(recommendations) > 1:
+            contested = ranking.get("tied", 0) > 1
+            if contested or not LLM_RERANK_ONLY_WHEN_TIED:
+                # Wrapped because respond() raising costs the evaluator the
+                # whole turn, recommendations included. The reranker already
+                # swallows its own failures; this is the belt to that braces.
+                try:
+                    cards = self.matcher.cards(recommendations)
+                    order, llm_usage = self._llm.order(state.category, state.heard, cards)
+                    recommendations = [recommendations[index] for index in order]
+                except Exception:
+                    pass
+
         # Early turns go out as rank-1-or-nothing: the harness stops at the
         # first hit, so a full slate would lock in whatever rank the coin flip
         # below the top happened to give us for the rest of the session.
@@ -1217,6 +1313,12 @@ class Agent:
 
         ask, usage = self._choose_attribute(state)
         state.record_ask(ask)
+        # Token usage is reported per turn, so both model calls have to land in
+        # the same figure the evaluator sums.
+        usage = {
+            "prompt_tokens": usage["prompt_tokens"] + llm_usage["prompt_tokens"],
+            "completion_tokens": usage["completion_tokens"] + llm_usage["completion_tokens"],
+        }
 
         if trimmed:
             message = TIED_PROMPT if ranking.get("tied", 0) > 1 else NARROW_PROMPT
