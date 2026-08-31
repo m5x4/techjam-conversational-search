@@ -19,3 +19,5 @@ tests/test_organizer_pipeline.py
 *.log
 catalog.jsonl.gz
 techjam-participant-kit.zip
+dev/
+tools/make_dev_set.py

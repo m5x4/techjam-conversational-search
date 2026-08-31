@@ -1,0 +1,495 @@
+# Experiment log
+
+What was tried on the conversational-search agent, and what it did to the score.
+Companion to `starter/agent.py` — the code carries the rationale, this file carries
+the record.
+
+## How to read the numbers
+
+`TechnicalScore = 0.50*HitRate@10 + 0.30*MRR + 0.20*Efficiency`, where
+`Efficiency = clip((11 - MTTC)/10, 0, 1)`.
+
+Three evaluation sets are used, and a delta is only comparable within one of them:
+
+| Set | Size | Command | What it is |
+| --- | --- | --- | --- |
+| **public** | 200 | `python3 -m evaluator.local_evaluator` | The released labeled sessions. The leaderboard-comparable number. |
+| **dev-800** | 800 | `python3 -m evaluator.local_evaluator --dataset dev/dev_set.jsonl --output dev/dev_results.json` | Stratified to match the public target distribution (TVD ≈ 0.27). The tie-breaker when public is too small to separate two variants. |
+| **dev-full** | 2,000+ | `python3 tools/run_dev.py` | Broad sweep over the catalog. Scores lower by construction — 37% of it is items the public set never samples — so read it for direction, never as a leaderboard estimate. |
+
+Public is 200 sessions, so one session is worth ~0.0025 of hit rate. Anything under
+about +0.002 on public alone is noise; that is why most decisions below were made on
+dev-800 and confirmed on public.
+
+## Score timeline
+
+| Stage | Public score | Hit@10 | MRR | MTTC |
+| --- | --- | --- | --- | --- |
+| Shipped weak-BM25 baseline (`docs/baseline_results.json`) | 0.1067 | 0.125 | 0.068 | 9.81 |
+| Constraint-accumulating rewrite (`60aad56`) | — | — | — | — |
+| Linear reranker added (`325d5d6`, commit msg) | 0.9063 | — | — | — |
+| (`a788ece`, commit msg) | 0.906 | — | — | — |
+| Exposure gate at turns 1–2 | 0.9600 | — | — | — |
+| Bucket prefilter (`results.json`) | 0.9635 | 1.000 | 0.9609 | 2.24 |
+| Ratings-velocity feature (current tree) | **0.9663** | 1.000 | 0.9666 | 2.185 |
+
+Current dev-800: 0.9579 raw / 0.9617 public-reweighted (was 0.9551 / 0.9592).
+Current dev-full 2,000: 0.9291 (hit 0.9845, MRR 0.9025, MTTC 2.694).
+
+---
+
+## 1. Reading the customer
+
+**Constraint accumulation instead of query rewriting** — *landed, the whole win.*
+The simulator quotes the target's own catalog strings verbatim, so every turn is
+evidence rather than a paraphrase. Parse the disclosed phrases out, accumulate them
+across the session, and use them as exact-phrase filters: eliminate first, rank
+second. This is the step that moved the score from 0.107 to ~0.90.
+
+**Splitting reveals on `; `** — *landed.* A constraint may itself contain a semicolon,
+so splitting is ambiguous, but it is safe under both readings: if the real constraint
+was "A; B" then A and B are each still phrases of the target. The joined form matched
+the wrong product often enough to evict the right one.
+
+**Distinguishing the two refusal phrasings** — *landed.* "I don't have **a**
+preference for X" is a one-off Boundary-scenario shrug and says nothing about X;
+"**an additional** preference for X" means X is genuinely exhausted. Treating them
+alike either burned attributes that still had constraints left, or kept re-asking
+spent ones.
+
+**Unrecognised phrasings fall through to a weak whole-line phrase** — *landed.*
+Rewording degrades the signal instead of erasing it.
+
+## 2. Retrieval
+
+**Coarse-category bucket prefilter** — *landed, the last big win.*
+The opening message embeds the evaluator's own `coarse_category(...)` output verbatim,
+so the agent mirrors that function, buckets the 50k catalog, and hard-restricts
+retrieval to the target's bucket.
+
+- public 0.9592 → **0.9635**, hit rate 0.995 → **1.000**; dev-800 0.9500 → **0.9551**.
+- Before it, **40 of 200** public sessions returned a turn-1 top-10 with *zero* items
+  from the target's bucket, even though the category was parsed correctly — it was
+  only a soft token constraint.
+- Cost: roughly 2× session latency (~24ms → ~50ms), from the UNINDEXED `bucket_key`
+  filter and the bucket-only backfill scans. Not optimized.
+- Not a recall backbone — recall@10 was already 0.995 without it. Its value is turn-1
+  precision, i.e. MTTC.
+
+**Exact bucket lookup only, no fuzzy ladder** — *landed, deliberate.*
+The opener fragment matches a bucket key byte-for-byte in **200/200** public sessions,
+so containment / token-overlap / singularization fallbacks would be dead code. It is
+also the safe side of the trade: a *guessed* bucket hard-excludes the target, which
+ranking can never recover from, while a missed bucket only falls back to the
+unrestricted pipeline.
+
+**Keeping the category terms in the MATCH expression once the bucket filters**
+(`BUCKET_KEEPS_CATEGORY_TERMS`) — *landed.* Redundant as a filter, not as a ranking
+signal: it is what puts the taxonomy words into the BM25 score that orders the pool.
+Dev-800: keep **+0.0051** vs drop +0.0025.
+
+**Constraint backoff ladder** — *landed.* Apply the most specific constraint first (a
+long verbatim feature narrows far harder than a bare material word); any form that
+would zero the count is dropped rather than allowed to empty the pool. A clipped
+constraint also retries without its trailing partial token, because the customer clips
+at 180 chars and that can land mid-word.
+
+**Price excluded from the filter stage** — *landed.* A budget the catalog cannot
+satisfy exactly zeroed every count and dropped every text constraint with it. Applied
+at ranking time instead, where it can be backed out safely, and dropped entirely if it
+would return nothing.
+
+**Non-English boilerplate aliasing** (`进口` → `imported`) — *landed deliberately, and
+it costs a little.* 323 catalog rows carry non-Latin text; in 212 of them the only
+non-English content is a lone `进口` ("imported") feature bullet, unreachable by any
+English query. The alias indexes the English sense *alongside* the original, never
+instead of it, and sharing the original bullet's position slot — the customer quotes
+verbatim, so a constraint that reads "进口" still has to match the bullet it came from.
+Applied on a second pass, so the one row carrying *both* `进口` and a real `Imported`
+bullet (`B0BD3W6QR7`) keeps its genuine bullet's slot. Verified over all 50,000 rows:
+212 gain the alias, no existing key's position moves.
+
+Measured on dev-800 (`BUCKET_ENABLED=True`, only the alias table toggled, in-process):
+
+| | alias off | alias on | delta |
+| --- | --- | --- | --- |
+| TechnicalScore | 0.955379 | **0.955129** | **−0.000250** |
+| MRR | 0.947012 | 0.946179 | −0.000833 |
+| Hit@10 / MTTC | 0.996250 / 2.343 | 0.996250 / 2.343 | unchanged |
+
+Two sessions move, both down: `dev_0281` rank 1 → 2, `dev_0356` rank 2 → 3. Nothing
+improves, and nothing can — `intent_card()` builds constraints verbatim from the
+target's own bullets, so a `进口` row's constraint *is* `进口`, which already matches
+exactly through `self.items`. The alias sits on a branch no session reaches.
+
+The cost is not dilution in the vague sense. `Imported` is boilerplate on 13,846 of
+50,000 rows, which makes it a near-random partition uncorrelated with everything else
+in a query — an unusually good separator of near-duplicates. `dev_0281`'s target is
+`B07ZNLTF7X` (VIJIV sequin flapper dress), whose four disclosed constraints are
+`polyester` / `100% polyester` / `imported` / `zipper closure` — all boilerplate, none
+describing a flapper dress. The only thing keeping `B09TFHCSKT` ("Women 1920s Gatsby
+Flapper Dresses Sequin ...", shares *dress*, *flapper*, *sequin*, same category, same
+`100% Polyester` + `Zipper closure`) out of the results was that it says `进口` where
+the target says `Imported`. Aliasing removes exactly that separation, so the rows the
+alias admits are drawn from the target's closest lookalikes rather than from random
+junk. The benefit and the harm are one mechanism: making a row reachable by "imported"
+*is* making it a competitor on "imported", and no split of the index surfaces gets one
+without the other.
+
+Kept anyway, with open eyes: −0.00025 buys catalog correctness that this evaluator
+cannot reward but a real shopper would expect. The generalizable warning is the
+inverse — low-information boilerplate (`Imported`, `Machine Wash`, `Pull On closure`,
+department strings) can be load-bearing *because* it is meaningless and therefore
+uncorrelated with the query. Normalizing it away is not free.
+
+**Dual-track routing** — *landed.* A shopper who leads with a requirement goes down the
+precision/filter track; one who leads with only a category goes down a browse track
+that spreads the ten slots across the category (deduped by store and by title shape),
+because with nothing to filter on, ten near-neighbours are a poor guess that teaches
+nothing.
+
+**Deep paging on dry turns instead of a served-item blacklist** — *landed, and the
+blacklist was rejected.* Once the customer stops disclosing, the ranking stops changing
+and the ten items produced have already been shown and missed, so a dry turn pages one
+slate deeper. It is an offset, not a blacklist: an Intent Override session does not
+register a hit until the override lands, so the target can legitimately appear in an
+early slate without ending the session — blacklisting what was shown would bury it for
+the rest of that session.
+
+## 3. Ranking
+
+**Linear reranker over a 500-candidate pool** — *landed* (`325d5d6`, 0.9063).
+Five features — exact match, loose substring, position, popularity, BM25 rank — scored
+as a plain dot product. BM25 survives as the tie-break, so a session with no usable
+evidence returns exactly what it returned before the reranker existed.
+
+**Position feature** (`POSITION_W = 0.30`) — *landed.* A bare attribute word matches by
+substring against the whole product text, so the jacket that *is* nylon and the cotton
+jacket that ships with a nylon carry bag earn byte-identical evidence — **51 of the 56**
+sessions lost to an evidence tie were exactly this. Manufacturers lead with the defining
+material and bury the incidental ones, so the index of the match separates them.
+Weighted so position + popularity + BM25 stays under the 0.6 that one loose match is
+worth: tie-breakers may only reorder candidates evidence has already declared equal.
+
+**Position counting toward the tie count** (`POSITION_BREAKS_TIES`) — *tried, left off.*
+It no longer gates anything (the exposure gate replaced the tie gate), so it would only
+change how a trimmed slate is described to the customer, and position is not a reliable
+enough separator to claim the items are distinguishable.
+
+**Offline weight tuning** (`tools/tune_reranker.py`) — *landed as tooling.*
+Re-running the evaluator per candidate vector costs ~20s, i.e. a few hundred trials a
+day. Nothing upstream of the ranking depends on the ranking, so sessions can be traced
+once and the cached candidates re-scored offline in milliseconds. Every feature is
+oriented so more is better, which makes the pruning exact rather than approximate:
+candidates dominated by the target in all five features can never overtake it under any
+non-negative weights. `search` reports on a held-out split, and re-running under several
+`--split-salt` values is the cheap test for whether a gain is real or fitted.
+
+**Popularity weight, and whether "nearly tied" should count as tied** — *swept, nothing
+changed, and two of the three questions turned out to be structurally closed.* Measured
+on a fresh 1,000-session trace (public + dev, 0 mismatched turns, live 0.9568); the
+earlier traces were stale against `agent.py` and would have measured the pre-bucket
+retrieval.
+
+Sweeping `pop_w` alone, paired bootstrap (2,000 draws) against the shipped 0.30:
+
+| `pop_w` | raw delta | 95% CI | public delta | 95% CI |
+| --- | --- | --- | --- | --- |
+| 0.00 | −0.02058 | [−0.0251, −0.0165] | −0.02520 | [−0.0308, −0.0201] |
+| 0.20 | −0.00280 | [−0.0050, −0.0011] | −0.00389 | [−0.0067, −0.0018] |
+| **0.30** | — | shipped | — | shipped |
+| 0.35 | +0.00089 | [−0.0007, +0.0030] | +0.00028 | [−0.0007, +0.0014] |
+| 0.50 | +0.00145 | [−0.0001, +0.0033] | +0.00111 | [−0.0001, +0.0023] |
+| 1.00 | +0.00164 | [−0.0005, +0.0040] | +0.00164 | [−0.0001, +0.0035] |
+
+0.30 sits exactly on the knee: every step down is significant, every step up has a CI
+straddling zero. Popularity is not a small feature — deleting it costs **−0.021 raw /
+−0.025 public**, which is more than the bucket prefilter won — it is simply already
+tuned.
+
+*Popularity is already a pure tie-break, not merely weighted like one.* Scaling the
+evidence weights 100x (`150, 60, 0.30, 0.30, 0.10`), which makes it arithmetically
+impossible for a tie-break to cross an evidence boundary, scores **identically to the
+shipped vector: delta +0.00000, zero-width CI.** The invariant §3 documents — tie-breakers
+may only reorder candidates evidence has declared equal — is binding in practice on all
+1,000 sessions, not just by construction. There is no lexicographic variant to build.
+
+*A tie **tolerance** cannot do anything.* Evidence is `1.5*exact + 0.6*loose` over integer
+counts, so it is quantized. Across all 52,971 carried candidate rows the target-to-rival
+evidence delta takes **24 distinct values, and the smallest nonzero one is 0.6**:
+
+| delta (rival − target) | rows | share |
+| --- | --- | --- |
+| **0.00** | 21,959 | 41.5% |
+| −1.50 | 10,873 | 20.5% |
+| −4.20 | 4,944 | 9.3% |
+| −2.10 | 4,722 | 8.9% |
+
+So any epsilon below 0.6 merges nothing at all, and any epsilon at or above 0.6 merges
+candidates separated by a full loose match — the atomic unit of evidence, not a rounding
+artifact. There is no "nearly tied" band between the two. (`tied` has exactly one
+consumer, the `TIED_PROMPT`/`NARROW_PROMPT` choice, so widening it would change wording
+rather than ranking, and would need a full dev run rather than a trace replay to score.)
+
+Ties are common and the tie-break is load-bearing — 41.5% of carried rows are exact
+evidence ties, median 3 tied rivals per ranked turn, max 315 — which is why popularity
+is worth 2 points. The lever that is exhausted is *reweighting* it; splitting those
+groups needs a new signal, not a bigger `pop_w`.
+
+**Provenance features: `Date First Available`, `average_rating`, store name** — *built,
+measured, reverted.* The follow-on to the popularity sweep above: if reweighting the
+tie-break is exhausted, try a new signal. Three were added as *separate* features
+(rather than one hand-blended composite) so the tuner could price each independently
+and say which, if any, carried its weight. Spliced in ahead of BM25, which must stay
+last — the dominance pruning relies on the final coordinate being strictly decreasing
+in pool position. `tools/tune_reranker.py` was generalised from a hardcoded 5-tuple to
+an arbitrary-length vector to support this; **that generalisation was kept.**
+
+The catalog-side priors looked genuinely promising, which is the point of the entry:
+
+- **Recency survives conditioning on `rating_number`** — the test `average_rating`
+  fails. Inside a fixed rating band, an item first listed in 2019+ is 2.54x likelier to
+  be the target in the 0–100 band and 2.56x in 100–1,000. It is not popularity in
+  disguise: a newer item has *fewer* ratings, so the two signals partly oppose.
+- Marginal year lift runs from 0.26x (2014) to **5.56x (2023)**. Coverage is good:
+  93.8% of the catalog, 97.5% of targets.
+- `Generic` covers 197 rows for **0 targets**, exactly the "no-name store" pattern one
+  would predict — but the prior only expects ~0.8, so P(0) ≈ 0.45. Not significant.
+  Nor is it a *generic* pattern: Nike has 564 rows and 0 targets, PUMA 265 and 0.
+
+Every one of them died on contact with the reranker (1,000-session trace, provenance-off
+baseline 0.95680 raw / 0.96081 public):
+
+| feature | best weight | raw delta | 95% CI | verdict |
+| --- | --- | --- | --- | --- |
+| recency | 0.05 | +0.00024 | [−0.0008, +0.0013] | **harmful above 0.1**, monotonically |
+| quality (`average_rating`) | 0.10 | +0.00059 | [−0.0006, +0.0022] | noise |
+| brand (store not anonymous) | any | +0.00015 | [+0.0000, +0.0005] | **perfectly flat** |
+
+`recency` is the instructive failure. It decays monotonically — 0.95680 → 0.95189 at
+w=0.5 → 0.94942 at w=0.8 — despite a real, conditioning-proof marginal lift. The lift is
+a *catalog-wide* prior, and by the time the reranker sees a tie group the pool is already
+filtered to one category and ordered by popularity; within that group the newer rival is
+not the likelier target. A prior that is real over 50,000 rows can be worthless over the
+three rows that are actually tied.
+
+`brand` scores *identically* at every weight from 0.05 to 0.8. Its deltas among carried
+candidates are all zero: a target and its close rivals sit in the same category and are
+almost always both real brands, so the feature never discriminates where discrimination
+is needed. A 0-target store list is not a tie-break.
+
+The joint search overfits exactly as the split is designed to catch: **+0.0037 on train
+(0.9601 → 0.9638), −0.0004 on holdout**, CI covering zero, and it gets there by pushing
+`popularity` to 2.9 and crushing `loose` to 0.17 — i.e. by breaking the evidence-dominance
+invariant that §3 exists to protect. Reverted: the features nearly doubled carried
+candidate rows (52,971 → 97,553) by weakening the dominance pruning, which taxes every
+future tuning run, and they bought nothing. Post-revert trace reproduces the baseline
+exactly (52,971 rows, 0.956797).
+
+The generalisable lesson matches the `进口` entry from §2: a signal's marginal lift over
+the whole catalog says nothing about its value *inside a tie group*, because retrieval
+has already conditioned the pool on most of what made the lift look real.
+
+**Ratings velocity — `rating_number` normalised by listing age** — *landed, +0.0028.*
+The one thing in this line of work that survived. `VELOCITY_W = 0.5`, alongside an
+unchanged `pop_w = 0.30`.
+
+It exists because it is an **interaction the linear model cannot build for itself**.
+Popularity and recency were both already available as additive terms, and no weight
+vector over the two expresses a ratio. The additive form had already been measured and
+rejected — recency on its own decays monotonically, 0.9568 to 0.9494 at w=0.8 — so the
+*same two fields*, combined as a denominator rather than a summand, going from harmful
+to +0.0028 is the entire result. Nothing was added to the catalog; only the formula
+changed.
+
+Measured three ways, all agreeing:
+
+| | baseline | velocity 0.5 | delta |
+| --- | --- | --- | --- |
+| trace replay, raw | 0.95680 | 0.95961 | **+0.00282** (95% CI [+0.0007, +0.0054]) |
+| trace replay, public-weighted | 0.96081 | 0.96324 | **+0.00243** (95% CI [+0.0006, +0.0044]) |
+| live public-200 | 0.963471 | **0.966279** | +0.002808 (MRR 0.9609 → 0.9666, MTTC 2.24 → 2.185) |
+| live dev-800 raw | 0.955129 | **0.957947** | +0.002818 |
+| live dev-800 public-reweighted | 0.959192 | **0.961748** | +0.002556 |
+
+Three findings worth keeping:
+
+- **The naive intuition for this feature is backwards.** "Old listings had longer to
+  accumulate ratings, so normalise by age" does not hold in this catalog:
+  `corr(log1p(ratings), age) = −0.118`. *Newer* listings carry more ratings, not fewer
+  (mean ~14 for 2015 vintage, ~33 for 2020). Velocity earns its keep in spite of the
+  correlation running the wrong way for it, not because of it.
+- **It is additional to popularity, not a redistribution of it.** Replacing popularity
+  outright is worse at every velocity weight (0.9459 at v=0.1, still below baseline at
+  v=0.5); splitting a fixed 0.30 budget across the two is flat. The gain requires new
+  weight. Popularity backs the item with the most ratings outright, velocity backs the
+  one accumulating them fastest, and it is the *disagreement* that splits a tie group.
+- **It is still a tie-break in practice, despite exceeding the 0.6 bound.** At v=0.5 the
+  tie-breakers can arithmetically out-vote one loose match. Forcing evidence to dominate
+  (weights x100) moves the score by **+0.00004 raw / +0.00008 public**, so ~99.97% of
+  the gain is within-tie-group reordering. `VELOCITY_W = 0.3` keeps the §3 invariant
+  exactly binding for about 0.001; 0.5 was kept with that trade recorded.
+
+Holdout stability across six independent `--split-salt` cuts: four clearly positive
+(+0.0015 to +0.0056), one flat, one slightly negative (−0.0003). Real, and noisy at this
+sample size — the effect is roughly the size of one dev-800 stratum.
+
+**Per scenario, the aggregate replicates but the attribution does not.** Overall the two
+sets agree to five decimals (+0.00281 public, +0.00282 dev); which scenario pays for it
+they disagree about outright.
+
+Public-200:
+
+| scenario | n | Hit@10 | MRR | MTTC | score delta |
+| --- | --- | --- | --- | --- | --- |
+| buying | 80 | 1.000 → 1.000 | 0.9587 → 0.9764 (+0.0177) | 1.637 → 1.538 | **+0.00731** |
+| intent_override | 30 | 1.000 → 1.000 | 0.9370 → 0.9417 (+0.0046) | 3.600 → 3.600 | +0.00139 |
+| boundary | 10 | 1.000 → 1.000 | 1.0000 → 1.0000 | 3.100 → 3.100 | 0.00000 |
+| browsing | 80 | 1.000 → 1.000 | 0.9672 → 0.9620 (−0.0052) | 2.225 → 2.188 | **−0.00081** |
+| **overall** | 200 | 1.000 → 1.000 | 0.9609 → 0.9666 (+0.0057) | 2.240 → 2.185 | **+0.00281** |
+
+Dev-800:
+
+| scenario | n | Hit@10 | MRR | MTTC | score delta |
+| --- | --- | --- | --- | --- | --- |
+| boundary | 40 | 0.975 → **1.000** | 0.9208 → 0.9458 (+0.0250) | 3.425 → 3.275 | **+0.02300** |
+| intent_override | 120 | 0.9917 → 0.9917 | 0.9302 → 0.9436 (+0.0134) | 3.517 → 3.517 | +0.00402 |
+| browsing | 320 | 1.000 → 1.000 | 0.9478 → 0.9535 (+0.0057) | 2.341 → 2.291 | +0.00270 |
+| buying | 320 | 0.9969 → 0.9969 | 0.9537 → 0.9504 (−0.0033) | 1.769 → 1.722 | −0.00004 |
+| **overall** | 800 | 0.9962 → 0.9975 | 0.9462 → 0.9504 (+0.0042) | 2.342 → 2.296 | **+0.00282** |
+
+Public says buying wins (+0.0073) and browsing pays (−0.0008); dev says browsing wins
+(+0.0027) and buying is flat-negative. Both cannot be the mechanism. With 80 buying
+sessions on the public set the per-scenario MRR moves are within their own noise, so the
+decomposition should not be read as a finding — only the aggregate replicates.
+
+**The one thing that is consistent across every scenario on both sets is MTTC: it
+improves or holds, and never worsens** (public 1.637→1.538, 2.225→2.188; dev 3.425→3.275,
+2.341→2.291, 1.769→1.722). MRR moves in both directions depending on the slice. That
+matches §7 — the remaining headroom was Efficiency, and this feature converts earlier
+rather than ranking better, which is where the points actually were.
+
+The generalisable point, against the reverted provenance features directly above: those
+failed as *additive priors* over the whole catalog. The same fields succeed as a *ratio*,
+because retrieval has already conditioned the pool on category and popularity, and what
+survives that conditioning is not a level but a rate.
+
+## 4. Turn policy — where the remaining points actually were
+
+**Exposure gate: serve only the single best candidate on early turns** — *landed, the
+second-biggest win.* The harness ends the session the moment the target appears
+anywhere in the slate, so whatever rank it surfaces at is the rank it is scored on
+forever. Early on, the order below the top is settled by popularity and BM25 position —
+close to a coin flip — so a full slate spends the session's one scoring opportunity on
+that coin flip. Serving top-1 makes it rank 1 or nothing; a miss costs one turn, which
+is the cheap side: an extra turn costs `0.2 × (1/200)/10`, while lifting a hit from rank
+3 to rank 1 is worth `0.3 × (2/3)/200` — roughly ten times as much.
+
+Measured, public / dev:
+
+| Reveal schedule | Public | Dev |
+| --- | --- | --- |
+| Full slate every turn (the old withhold-on-tie gate) | 0.9497 | 0.9415 |
+| Turn 1 only | 0.9440 | 0.9319 |
+| **Turns 1–2 (shipped)** | **0.9600** | **0.9503** |
+| Turns 1–3 | 0.9526 | 0.9370 |
+| Turn 1, then top-3 on turn 2 | 0.9503 | 0.9406 |
+| Turns 1–2, but turn 2 only when the top is tied | 0.9593 | 0.9471 |
+
+Turn 1 alone gives back most of the win — by turn 2 the second constraint has landed and
+the top-1 is worth betting on — and turn 3 starts losing sessions outright, which costs
+hit rate at 0.5 against MRR's 0.3. Gating on the tie test is worse than trimming
+unconditionally, so ties no longer decide anything; they only pick which explanation the
+customer is given.
+
+**Withholding the slate entirely** — *tried, strictly worse.* An empty slate cannot
+convert at all, and the top-1 it was suppressing converts often enough to be worth
+**+0.0096 public / +0.0056 dev** on its own.
+
+**Boundary slack: an evidence-free turn buys the gate one more turn** — *landed.*
+A Boundary shrug costs a turn and discloses nothing, shifting that whole scenario one
+turn later than Browsing — its first constraint lands on turn 3, not turn 2. The gate
+counts turns, so by then it had already opened, and the first genuinely-ranked slate
+went out at full width. Browsing converts 51.5% of its sessions on the gated turn 2 at
+100% rank-1; Boundary converted 75.8% on the ungated turn 3 at 64.1% — essentially the
+whole 0.166 MRR gap between them. Over 2,490 Boundary dev sessions: MRR 0.7397 →
+**0.8990** (Browsing sits at 0.9062), hit −0.0020, MTTC +0.286. No other scenario emits
+that refusal, and the change was verified bit-identical over 5,914 non-Boundary
+sessions.
+
+**Asking `other` every turn** — *landed by measurement, not by laziness.* The customer
+releases any undisclosed constraint for `other`, but only same-class constraints for a
+typed attribute, so `other` strictly dominates the typed asks.
+
+## 5. Intent override — taking the override literally
+
+Tried: on "actually, ignore my earlier preference", clear the accumulated constraints
+(and optionally the category and the ask history). It was measurably wrong. The
+simulator draws the replacement from `hard_constraints[0]` of the **same** target and
+the superseded preference from that same target's `soft_preferences`, so the customer
+never says anything false and the target never changes. Resetting also creates its own
+failure mode: when the replacement is a bare word like "cotton", filtering on it alone
+leaves a pool the target does not survive into, and no reranking recovers an item
+retrieval never returned.
+
+Re-measured on the current tree (2026-08-31), everything else held fixed:
+
+| `OVERRIDE_RESETS` | Public | Dev-800 | Override-scenario MRR (public / dev) |
+| --- | --- | --- | --- |
+| `True` — reset (**current setting**) | 0.963471 | 0.955129 | 0.9370 / 0.9302 |
+| `False` — keep constraints | **0.964242** | **0.956320** | **0.9542 / 0.9383** |
+
+Keeping is worth **+0.0008 public / +0.0012 dev**, concentrated entirely in the
+Intent Override scenario, and it also lifts dev hit rate 0.99625 → 0.99750.
+
+> ⚠️ **Open item.** `OVERRIDE_RESETS = True` in `starter/agent.py`, so the tree is
+> currently running the *worse* branch, while the comment above it and the inline
+> comment in `SessionState.absorb` both describe it as off. Flip it to `False` (or
+> restate the intent) before submitting. Note this is separate from `heard`, which is
+> never cleared — ranking always sees the superseded preference even when filtering
+> forgets it.
+
+## 6. Tried and abandoned
+
+**A local LLM (Ollama) choosing `ask_attribute`** — *abandoned, path is dead code.*
+`_make_client()` returns `None` unconditionally before its body ever runs, so the agent
+is standard-library-only and deterministic, which is what official scoring expects.
+The deterministic answer (`other`, see §4) dominates anyway, so the model had nothing to
+add; the plumbing (warm-up call, on-list validation, exception fallback, token
+accounting) is left in place but inert.
+
+**Fuzzy bucket matching** — never built; the exact lookup hits 200/200 (§2).
+
+**Tie-gated exposure, top-3 on turn 2, turns 1–3** — all measured, all worse (§4 table).
+
+**Served-item blacklist** — rejected in favour of a paging offset (§2).
+
+**Provenance features** (`Date First Available`, `average_rating`, store name) — built,
+measured, reverted (§3). Real catalog-wide priors, no value inside a tie group.
+
+## 7. Where the remaining headroom is
+
+At 0.9635 public with hit rate 1.000 and MRR 0.961, ~0.036 remains and **~0.025 of it is
+Efficiency** — converting on turn 1 instead of turns 2–3. Recall is done; ranking is
+nearly done. It is easy to keep tuning the reranker for MRR and buy almost nothing,
+because MRR is only 30% of the score and already at 0.96. The diagnostic worth printing
+for any new idea is the turn distribution (how many sessions convert on turn 1 vs 2 vs
+3), not just hit rate.
+
+**Caveat when comparing any two runs.** `Matcher.features()` emits the incoming BM25
+rank as `-(position / depth)` with `depth = len(pool)`, so that feature is scaled by how
+large the candidate pool happens to be. Any retrieval change that shrinks the pool — the
+bucket prefilter cut the median dev pool from 2 to 1 and the mean from 43 to 27 —
+silently changes that feature's effective weight even though no weight was touched.
+Re-run `tools/tune_reranker.py` after a retrieval change before treating the measured
+delta as final. (The bucket prefilter's +0.0051 on dev-800 was measured against weights
+tuned *without* it, so it is probably an underestimate.)
+
+## Tooling built along the way
+
+| Tool | Why it exists |
+| --- | --- |
+| `tools/run_dev.py` | Shards dev sessions across cores (~25 min → minutes), and scores twice: raw, and reweighted so each stratum contributes its public-set share. Reports Kish effective sample size, because reweighting a large run to a distribution concentrated in ~180 catalog rows buys far less precision than the raw count suggests. |
+| `tools/make_dev_set.py` | Builds the stratified dev set. An exhaustive set is 37% items the public set never samples (TVD ≈ 0.86 vs 0.27 for the stratified 800), so its raw score answers a different question. |
+| `tools/tune_reranker.py` | `trace` / `replay` / `search` for offline weight tuning (§3). |
+| `tools/oracle.py` | Single-session inspection: `python3 tools/oracle.py --policy agent --dataset dev/dev_set.jsonl --show dev_0020`. |
