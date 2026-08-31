@@ -31,7 +31,8 @@ dev-800 and confirmed on public.
 | (`a788ece`, commit msg) | 0.906 | — | — | — |
 | Exposure gate at turns 1–2 | 0.9600 | — | — | — |
 | Bucket prefilter (`results.json`) | 0.9635 | 1.000 | 0.9609 | 2.24 |
-| Ratings-velocity feature (current tree) | **0.9663** | 1.000 | 0.9666 | 2.185 |
+| Ratings-velocity feature | 0.9663 | 1.000 | 0.9666 | 2.185 |
+| `OVERRIDE_RESETS = False` (current tree) | **0.9670** | 1.000 | 0.9688 | 2.185 |
 
 Current dev-800: 0.9579 raw / 0.9617 public-reweighted (was 0.9551 / 0.9592).
 Current dev-full 2,000: 0.9291 (hit 0.9845, MRR 0.9025, MTTC 2.694).
@@ -366,7 +367,7 @@ decomposition should not be read as a finding — only the aggregate replicates.
 **The one thing that is consistent across every scenario on both sets is MTTC: it
 improves or holds, and never worsens** (public 1.637→1.538, 2.225→2.188; dev 3.425→3.275,
 2.341→2.291, 1.769→1.722). MRR moves in both directions depending on the slice. That
-matches §7 — the remaining headroom was Efficiency, and this feature converts earlier
+matches §8 — the remaining headroom was Efficiency, and this feature converts earlier
 rather than ranking better, which is where the points actually were.
 
 The generalisable point, against the reverted provenance features directly above: those
@@ -442,14 +443,143 @@ Re-measured on the current tree (2026-08-31), everything else held fixed:
 Keeping is worth **+0.0008 public / +0.0012 dev**, concentrated entirely in the
 Intent Override scenario, and it also lifts dev hit rate 0.99625 → 0.99750.
 
-> ⚠️ **Open item.** `OVERRIDE_RESETS = True` in `starter/agent.py`, so the tree is
-> currently running the *worse* branch, while the comment above it and the inline
-> comment in `SessionState.absorb` both describe it as off. Flip it to `False` (or
-> restate the intent) before submitting. Note this is separate from `heard`, which is
-> never cleared — ranking always sees the superseded preference even when filtering
-> forgets it.
+> **Resolved (2026-09-01).** `OVERRIDE_RESETS = False` is now what the tree runs, which
+> is what the comment above it and the inline comment in `SessionState.absorb` always
+> described. Public moved 0.9663 → 0.9670, override-scenario MRR 0.9417 → 0.9567. Note
+> this is separate from `heard`, which is never cleared — ranking always sees the
+> superseded preference even when filtering forgets it.
 
-## 6. Tried and abandoned
+## 6. LLM reranking over the top 10
+
+*Built, measured across four local models and two prompt modes, shipped **off**.*
+`LLM_RERANK=1` enables it; the default path makes no model calls and scores exactly
+what it scored before the layer existed (0.9670, 0 tokens).
+
+### The ceiling that motivated it
+
+§8 says the remaining headroom is Efficiency — turn-1 conversion — so the question
+worth asking is how much of it a better top-1 could reach. Instrumenting `rerank` to
+record the untrimmed slate on every turn answers it exactly. Over the public set, the
+earliest turn the target appears anywhere in the reranked top 10:
+
+| Turn it first appears | At rank 1 | At rank 2–10 |
+| --- | --- | --- |
+| 1 | 65 | 32 |
+| 2 | 72 | 21 |
+| 3–4 | 10 | 0 |
+
+An oracle that always pulled the target to rank 1 of the slate the linear reranker
+already produced would score **0.9886** against 0.9670 — **+0.0216**, almost all of it
+Efficiency (MTTC 2.185 → 1.57, MRR → 1.000). Recall is not the constraint; ordering the
+ten items we already have is.
+
+### What the layer is allowed to do
+
+Reorder, and nothing else. `starter/llm_rerank.py` returns a permutation of the slate
+it was handed — indices the model omits are appended in their incoming order, indices
+it invents or repeats are dropped. It cannot introduce a product, cannot drop one, and
+therefore **cannot turn a hit into a miss**; the worst it can do is order a slate badly,
+which is the risk the linear model already carries. Every failure path — no client,
+unreachable server, timeout, malformed reply, exception — returns the incoming order,
+so scoring with the network disabled (`docs/submission_rules.md`) is identical to
+scoring without the file.
+
+It sits between ranking and the exposure trim, which is the only place it can pay: on
+turns 1–2 the slate is cut to one item, so reordering after the cut would reorder a
+list of length one. It is gated to those turns and to contested slates
+(`tied > 1`), which is 158 decisions over the 200 public sessions.
+
+Three levels of subordination, each measurable independently:
+
+| Level | What it means |
+| --- | --- |
+| `rank` mode | the model's ordering replaces the linear ordering within the top 10 |
+| `pick` mode | the model promotes **one** candidate; the other nine keep linear order |
+| promotion ceiling | the promotion is honoured only if the candidate came from rank ≤ N |
+
+`ceiling = 1` reproduces the linear baseline exactly, which is the sanity check that the
+policy plumbing is wired correctly.
+
+### Measurements
+
+The decision set is 158 gated decisions; the target is in the slate for 145 of them,
+and the linear reranker puts it first in **90 (0.621)**, MRR 0.7559. That is the number
+to beat, and no configuration beat it.
+
+| Model | Mode | Decisions | Linear top-1 | LLM top-1 | Fixed | Broke |
+| --- | --- | --- | --- | --- | --- | --- |
+| llama3.2 3B | rank | 15 | 6 | 1 | 0 | 5 |
+| llama3 8B | rank | 38 | 20 (0.526) | 17 (0.447) | **0** | 3 |
+| llama3.2 3B | pick | 145 | 90 (0.621) | 17 (0.117) | 15 | 88 |
+
+llama3-8B moved the target *up* zero times in 38 decisions. Sweeping the promotion
+ceiling over the cached answers (`tools/llm_policy.py`, free — no re-calling):
+
+| Ceiling | top-1 | MRR | Fixed | Broke | Net |
+| --- | --- | --- | --- | --- | --- |
+| linear | 90/145 (0.621) | 0.7559 | — | — | — |
+| none | 17/145 (0.117) | 0.4909 | 15 | 88 | **−73** |
+| ≤2 | 56/145 (0.386) | 0.6386 | 14 | 48 | −34 |
+| ≤3 | 36/145 (0.248) | 0.5651 | 15 | 69 | −54 |
+| ≤5 | 23/145 (0.159) | 0.5139 | 15 | 82 | −67 |
+
+> **Sample-size warning, recorded because it nearly cost a wrong conclusion.** On the
+> first 40 decisions, `ceiling ≤2` measured **+1** and looked like a marginal win. On
+> the full 145 the same policy is **−34**. Forty gated decisions is roughly a fifth of
+> the public set and separates nothing; the +1 was noise of exactly the size §"How to
+> read the numbers" warns about.
+
+mistral-7B was started and abandoned: it needs **26 s to emit an 8-token reply** to a
+trivial prompt on this machine, so it is CPU-bound here and a 158-decision run cannot
+finish in a useful time. Two 7–8B models resident at once made Ollama queue requests
+badly enough to stall a run for hours; the client's own timeout was verified to fire
+correctly (5.1 s at a 5 s setting), so that was contention, not a defect.
+
+### Why it failed — and why prompting was not the fix
+
+Not a prompt-engineering problem. The turn-1 decision is close to **information-free**.
+The shopper quotes one phrase lifted verbatim from the target's own listing, and every
+candidate in the tie group contains that same phrase:
+
+| Session | Evidence | Tied | Linear #1 | Target |
+| --- | --- | --- | --- | --- |
+| `public_0002` | `Buckle closure` | 108 | BULLIANT Men's Belt | Hide & Drink Men's Belt |
+| `public_0003` | `Stainless Steel Band` | 4 | Casio **Ladies** Watch | Casio **Men's** Watch |
+| `public_0005` | `leather` | 86 | Columbia 100% Leather Boot | GLOBALWIN boot, no leather bullet |
+
+Nothing in "Buckle closure" separates one leather belt from 107 others, and no amount of
+reasoning recovers what the message does not contain. The oracle ceiling is real but it
+requires *knowing* the answer, not deriving it.
+
+Worse, the system prompt told the model *"popularity is not a reason to rank a product
+higher"* — and popularity is the single most predictive signal available here, because
+the public set oversamples popular targets (`tools/run_dev.py` docstring: 24.5% have
+≥3000 ratings). The linear reranker already exploits that prior. The model was
+instructed to discard it and given nothing to replace it with.
+
+**The generalisable lesson.** A tie group is not a ranking problem waiting for a smarter
+ranker. It is a set of candidates the evidence genuinely does not separate, and the
+right move inside one is to bet the best available *prior* — which is what
+popularity + velocity + BM25 position already are — not to spend a model call
+re-deriving a coin flip. This is the same finding as the provenance-features entry in
+§3, arrived at from the opposite direction.
+
+### Cost, had it shipped
+
+158 calls per public-set run, 160,885 prompt / 316 completion tokens, p50 3.80 s and
+p95 7.44 s per call — about **10 minutes per evaluation** against ~6 seconds for the
+deterministic path, in exchange for a measured loss.
+
+### What was kept
+
+The layer stays in the tree, off, because the harness is what makes the negative result
+reusable: a stronger model can be dropped in and measured against the same 158
+decisions in minutes. `starter/llm_rerank.py` also carries an Anthropic backend that
+was written but never exercised — no key was available, and the local-only path was the
+one chosen. `tests/test_llm_rerank.py` pins the two invariants the design rests on
+(permutation, and fallback on every failure) so they cannot rot while the layer is dark.
+
+## 7. Tried and abandoned
 
 **A local LLM (Ollama) choosing `ask_attribute`** — *abandoned, path is dead code.*
 `_make_client()` returns `None` unconditionally before its body ever runs, so the agent
@@ -467,14 +597,29 @@ accounting) is left in place but inert.
 **Provenance features** (`Date First Available`, `average_rating`, store name) — built,
 measured, reverted (§3). Real catalog-wide priors, no value inside a tie group.
 
-## 7. Where the remaining headroom is
+**LLM reranking of the top 10** — built, measured, shipped off (§6). Four local models,
+two prompt modes, a promotion-ceiling sweep; the best configuration is −34 top-1 against
+the linear reranker on 145 decisions. The tie groups it was meant to break are
+information-free, not mis-ranked.
 
-At 0.9635 public with hit rate 1.000 and MRR 0.961, ~0.036 remains and **~0.025 of it is
+## 8. Where the remaining headroom is
+
+At 0.9670 public with hit rate 1.000 and MRR 0.969, ~0.033 remains and **~0.024 of it is
 Efficiency** — converting on turn 1 instead of turns 2–3. Recall is done; ranking is
 nearly done. It is easy to keep tuning the reranker for MRR and buy almost nothing,
-because MRR is only 30% of the score and already at 0.96. The diagnostic worth printing
+because MRR is only 30% of the score and already at 0.97. The diagnostic worth printing
 for any new idea is the turn distribution (how many sessions convert on turn 1 vs 2 vs
 3), not just hit rate.
+
+**That headroom is now bounded, and most of it is unreachable.** §6 measures the oracle:
+pulling the target to rank 1 of the slate the reranker already produces is worth
++0.0216, and *everything else* — better retrieval, more features, more turns — is worth
+at most the remaining ~0.011. But the oracle is an oracle. The 55 decisions the linear
+reranker gets wrong are dominated by tie groups where the shopper's one quoted phrase
+appears identically in every candidate, so the information to order them is not present
+in the session at all. Before building anything aimed at this headroom, check on the
+decision set (`tools/llm_bench.py capture`) whether the sessions it targets are actually
+separable; §6 is the record of what happens when they are not.
 
 **Caveat when comparing any two runs.** `Matcher.features()` emits the incoming BM25
 rank as `-(position / depth)` with `depth = len(pool)`, so that feature is scaled by how
@@ -492,4 +637,6 @@ tuned *without* it, so it is probably an underestimate.)
 | `tools/run_dev.py` | Shards dev sessions across cores (~25 min → minutes), and scores twice: raw, and reweighted so each stratum contributes its public-set share. Reports Kish effective sample size, because reweighting a large run to a distribution concentrated in ~180 catalog rows buys far less precision than the raw count suggests. |
 | `tools/make_dev_set.py` | Builds the stratified dev set. An exhaustive set is 37% items the public set never samples (TVD ≈ 0.86 vs 0.27 for the stratified 800), so its raw score answers a different question. |
 | `tools/tune_reranker.py` | `trace` / `replay` / `search` for offline weight tuning (§3). |
+| `tools/llm_bench.py` | `capture` writes the decision set the LLM gate would fire on (no model calls); `replay` scores a model against the linear top-1 on it. On the exposure turns top-1 accuracy *is* the score difference, so a prompt change costs a few hundred short prompts instead of a full evaluation run. |
+| `tools/llm_policy.py` | Sweeps acceptance policies over answers `replay --cache` already collected, so testing a new promotion ceiling costs zero calls. |
 | `tools/oracle.py` | Single-session inspection: `python3 tools/oracle.py --policy agent --dataset dev/dev_set.jsonl --show dev_0020`. |
