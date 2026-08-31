@@ -451,9 +451,12 @@ Intent Override scenario, and it also lifts dev hit rate 0.99625 → 0.99750.
 
 ## 6. LLM reranking over the top 10
 
-*Built, measured across four local models and two prompt modes, shipped **off**.*
-`LLM_RERANK=1` enables it; the default path makes no model calls and scores exactly
-what it scored before the layer existed (0.9670, 0 tokens).
+*Built, measured across four local models and two prompt modes and two architectures,
+shipped **off** at **−0.0058**.* `LLM_RERANK_ENABLED` is hard-wired to `False` in
+`starter/agent.py` — the env-var read above it is commented out deliberately, so no
+environment can switch this on during official scoring. Restore that line to re-enable
+it. The shipped path makes no model calls and scores exactly what it scored before the
+layer existed (0.9670, 0 tokens).
 
 ### The ceiling that motivated it
 
@@ -535,6 +538,83 @@ finish in a useful time. Two 7–8B models resident at once made Ollama queue re
 badly enough to stall a run for hours; the client's own timeout was verified to fire
 correctly (5.1 s at a 5 s setting), so that was contention, not a defect.
 
+### End to end, with it switched on
+
+The decision-set numbers above are a proxy. This is the score with the layer enabled
+(measured before it was hard-wired off), llama3.2-3B in `pick` mode, full public set:
+
+| Metric | LLM off | LLM on | Delta |
+| --- | --- | --- | --- |
+| Hit Rate@10 | 1.000000 | 1.000000 | **+0.000000** |
+| MRR | 0.968847 | 0.972181 | +0.003334 |
+| MTTC | 2.185 | 2.525 | **+0.340** |
+| Efficiency | 0.881500 | 0.847500 | −0.034000 |
+| **TechnicalScore** | **0.966954** | **0.961154** | **−0.005800** |
+
+167,409 tokens and ~40 minutes of wall clock, against ~6 seconds deterministic.
+
+Three things are worth reading out of this, and only the first is bad news.
+
+**Hit rate is unchanged at exactly 1.000.** The permutation invariant was a design
+claim; this is the measurement of it. A model that got 88 of 103 decisions wrong lost
+zero sessions.
+
+**MRR went *up* while the score went down.** Breaking a turn-1 hit does not fail the
+session — it survives to turn 3, where the exposure gate opens, the full slate goes
+out, and the linear ordering puts the target high anyway. The damage converts into
+extra turns rather than lost sessions, so it lands on Efficiency (20% of the score)
+instead of hit rate (50%).
+
+**The damage is confined to where the gate fires.** Buying MTTC 1.538 → 2.150 and
+Browsing 2.188 → 2.425; Boundary (3.100) and Intent Override (3.600) are untouched,
+because their turn-1/2 slates are not contested in the way the gate tests for.
+
+Together these are the argument for the guard rails rather than against them: a badly
+performing model cost **−0.0058**, and a pure-LLM reranker with no permutation
+constraint and no exposure gate would have taken hit rate down with it.
+
+### Final reranker vs. 7th feature
+
+The obvious objection to the architecture above is that the model *overrides* the
+linear ordering instead of contributing to it. The alternative is to make its pick one
+more term in the dot product, worth `w`, so it has to out-score the linear margin to
+move anything. `tools/llm_simulate.py` answers this off the cached answers — the model
+is not called again — by recovering each candidate's linear score and replaying both
+policies. The `identity` row reproducing 0.966954 exactly is what says the replay is
+faithful.
+
+| Policy | Score | MRR | MTTC | Turn-1 hits | Delta |
+| --- | --- | --- | --- | --- | --- |
+| linear only | 0.966954 | 0.9688 | 2.185 | **44** | — |
+| LLM as final reranker | 0.962154 | 0.9722 | 2.475 | 13 | −0.0048 |
+| 7th feature, `w=0.01` | 0.967054 | 0.9688 | 2.180 | 44 | +0.0001 |
+| 7th feature, `w=0.05` | 0.966754 | 0.9688 | 2.195 | 42 | −0.0002 |
+| 7th feature, `w=0.10` | 0.967154 | 0.9722 | 2.225 | 37 | +0.0002 |
+| 7th feature, `w=0.20` | 0.965154 | 0.9722 | 2.325 | 27 | −0.0018 |
+| 7th feature, `w=0.30` | 0.963754 | 0.9722 | 2.395 | 19 | −0.0032 |
+| 7th feature, `w=0.50` | 0.962754 | 0.9722 | 2.445 | 16 | −0.0042 |
+| 7th feature, `w=1.20` | 0.962254 | 0.9722 | 2.470 | 14 | −0.0047 |
+| 7th feature, `w≥2.00` | 0.962154 | 0.9722 | 2.475 | 13 | −0.0048 |
+
+**The feature form strictly dominates the reranker form, and its optimum is zero.** It
+is a generalisation of the reranker — at `w≥2` the two are identical, same score and
+same 13 turn-1 hits — and every smaller weight is better. So the feature form is the
+one to reach for if this is ever retried. But there is no peak: the two positive blips
+(`w=0.01`, `w=0.10`) are ±1 session against a ~0.002 noise floor, and from `w=0.20` the
+curve decays monotonically. A tuner maximising it lands at `w≈0`.
+
+The turn-1 hit column is the mechanism, and it is the column to watch: 44 → 37 → 27 →
+13 as the weight lets the model overcome progressively larger linear margins. Every
+weight that buys the model influence spends turn-1 conversions to get it.
+
+> **Limitation, in the direction that flatters the model.** Simulated reranker −0.0048
+> against the measured −0.0058. The gap is accounted for: when the LLM breaks a turn-1
+> hit the session reaches turn 2 and makes a second call that is not in the cache,
+> because the cache was captured from the baseline run where those sessions had already
+> ended at turn 1. The simulator falls back to identity there. So every LLM row above is
+> optimistic by roughly 0.001, more so at large `w`. The −0.0058 is a measurement; the
+> sweep is an estimate.
+
 ### Why it failed — and why prompting was not the fix
 
 Not a prompt-engineering problem. The turn-1 decision is close to **information-free**.
@@ -566,9 +646,10 @@ re-deriving a coin flip. This is the same finding as the provenance-features ent
 
 ### Cost, had it shipped
 
-158 calls per public-set run, 160,885 prompt / 316 completion tokens, p50 3.80 s and
-p95 7.44 s per call — about **10 minutes per evaluation** against ~6 seconds for the
-deterministic path, in exchange for a measured loss.
+167,409 tokens and **~40 minutes per public-set evaluation** against ~6 seconds for the
+deterministic path — in exchange for −0.0058. The run costs more than the decision-set
+benchmark suggested (158 calls, p50 3.80 s) because breaking turn-1 hits lengthens
+sessions, which produces more gated turns, which produces more calls.
 
 ### What was kept
 
@@ -597,10 +678,12 @@ accounting) is left in place but inert.
 **Provenance features** (`Date First Available`, `average_rating`, store name) — built,
 measured, reverted (§3). Real catalog-wide priors, no value inside a tie group.
 
-**LLM reranking of the top 10** — built, measured, shipped off (§6). Four local models,
-two prompt modes, a promotion-ceiling sweep; the best configuration is −34 top-1 against
-the linear reranker on 145 decisions. The tie groups it was meant to break are
-information-free, not mis-ranked.
+**LLM reranking of the top 10** — built, measured, shipped off (§6). End to end it costs
+**−0.0058** (0.9670 → 0.9611), all of it Efficiency; hit rate holds at exactly 1.000,
+which is the permutation invariant doing its job. Blending the model in as a weighted
+7th feature instead of an override is strictly the better architecture and its optimum
+weight is zero. The tie groups it was meant to break are information-free, not
+mis-ranked.
 
 ## 8. Where the remaining headroom is
 
@@ -638,5 +721,6 @@ tuned *without* it, so it is probably an underestimate.)
 | `tools/make_dev_set.py` | Builds the stratified dev set. An exhaustive set is 37% items the public set never samples (TVD ≈ 0.86 vs 0.27 for the stratified 800), so its raw score answers a different question. |
 | `tools/tune_reranker.py` | `trace` / `replay` / `search` for offline weight tuning (§3). |
 | `tools/llm_bench.py` | `capture` writes the decision set the LLM gate would fire on (no model calls); `replay` scores a model against the linear top-1 on it. On the exposure turns top-1 accuracy *is* the score difference, so a prompt change costs a few hundred short prompts instead of a full evaluation run. |
+| `tools/llm_simulate.py` | Replays cached model answers under a different architecture — pick-as-override against pick-as-a-weighted-feature — without calling the model again. Recovers each candidate's linear score from the live `features()` call rather than recomputing it, because the BM25 term is normalised by pool size. The identity policy reproducing the real score is the check that the replay is faithful. |
 | `tools/llm_policy.py` | Sweeps acceptance policies over answers `replay --cache` already collected, so testing a new promotion ceiling costs zero calls. |
 | `tools/oracle.py` | Single-session inspection: `python3 tools/oracle.py --policy agent --dataset dev/dev_set.jsonl --show dev_0020`. |

@@ -271,7 +271,8 @@ EXPOSURE_WIDTH = 1
 # Off by default. Official scoring may run without network access, and the
 # deterministic pipeline is what the recorded score was measured on; turning
 # this on is an opt-in that has to earn its place against that baseline.
-LLM_RERANK_ENABLED = os.environ.get("LLM_RERANK", "").strip().lower() in ("1", "true", "on", "yes")
+# LLM_RERANK_ENABLED = os.environ.get("LLM_RERANK", "").strip().lower() in ("1", "true", "on", "yes")
+LLM_RERANK_ENABLED = False
 
 # Which turns get a model call.
 #
