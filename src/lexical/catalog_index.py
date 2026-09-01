@@ -144,8 +144,13 @@ class _CatalogIndex:
             for line in handle:
                 if not line.strip():
                     continue
-                product = json.loads(line)
-                parent_asin = str(product["parent_asin"])
+                try:
+                    product = json.loads(line)
+                    parent_asin = str(product["parent_asin"])
+                except (ValueError, TypeError, KeyError):
+                    # One malformed / id-less row is skipped rather than
+                    # aborting the whole index build.
+                    continue
                 coarse = coarse_category(product.get("categories")).lower()
                 self.coarse_category_by_id[parent_asin] = coarse
                 bucket_map[coarse].append(parent_asin)

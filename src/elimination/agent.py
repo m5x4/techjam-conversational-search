@@ -52,6 +52,8 @@ class Agent:
         self._sessions: dict[str, SessionState] = {}
 
     def reset(self, session_id: str, user_profile: dict) -> None:
+        if not isinstance(user_profile, dict):
+            user_profile = {}
         self._sessions[session_id] = SessionState(user_profile)
 
     def _choose_attribute(self, state: SessionState) -> tuple[str, dict]:
@@ -80,10 +82,32 @@ class Agent:
     def respond(
         self, session_id: str, user_message: str, turn: int, top_k: int
     ) -> dict:
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            top_k = 10
+        if top_k <= 0:
+            top_k = 10
+        try:
+            turn = int(turn)
+        except (TypeError, ValueError):
+            turn = 1
+        if turn < 1:
+            turn = 1
+        if not isinstance(user_message, str):
+            user_message = "" if user_message is None else str(user_message)
+
         state = self._sessions.get(session_id)
         if state is None:
-            raise RuntimeError("reset must be called before respond")
-        state.absorb(user_message)
+            # respond() before reset() is a harness contract violation, but
+            # recovering with a fresh state keeps the session alive.
+            self.reset(session_id, {})
+            state = self._sessions[session_id]
+        try:
+            state.absorb(user_message)
+        except Exception:  # noqa: BLE001 -- a pathological message must not
+            # break the turn; constraints heard on earlier turns still stand.
+            pass
         ranking: dict = {}
         # Never allowed to break retrieval: an unrecognised phrase, or anything
         # unexpected here, leaves both tracks exactly as they were.

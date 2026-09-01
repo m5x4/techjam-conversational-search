@@ -122,9 +122,16 @@ class Matcher:
         batch: list[tuple] = []
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
-                product = json.loads(line)
+                if not line.strip():
+                    continue
+                try:
+                    product = json.loads(line)
+                    asin = str(product["parent_asin"])
+                except (ValueError, TypeError, KeyError):
+                    # One malformed / id-less row is skipped rather than
+                    # aborting the whole index build.
+                    continue
                 price = product.get("price")
-                asin = str(product["parent_asin"])
                 # value -> its index in this item's own metadata order. A dict
                 # rather than a set: membership stays O(1) for the exact tests
                 # below, and insertion order doubles as the position signal at

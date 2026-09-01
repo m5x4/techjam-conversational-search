@@ -84,16 +84,51 @@ class Agent:
             state.prior_rating = float(apr)
         self._sessions[session_id] = state
 
+    def _popularity_fallback(self, top_k: int) -> list[str]:
+        """A bare popularity-ordered slate straight off the index -- the
+        degraded result when `_retrieve` raises, so the turn still returns
+        candidates instead of propagating the exception."""
+        try:
+            ranked = sorted(
+                self.index.popularity,
+                key=lambda pid: self.index.popularity.get(pid, 0.0),
+                reverse=True,
+            )
+            return ranked[: max(0, top_k)]
+        except Exception:  # noqa: BLE001
+            return []
+
     def respond(
         self, session_id: str, user_message: str, turn: int, top_k: int
     ) -> dict:
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            top_k = 10
+        if top_k <= 0:
+            top_k = 10
+        if not isinstance(user_message, str):
+            user_message = "" if user_message is None else str(user_message)
+
         state = self._sessions.get(session_id)
         if state is None:
-            raise RuntimeError("reset must be called before respond")
+            # respond() before reset() is a harness contract violation, but
+            # recovering with a fresh state keeps the session alive.
+            self.reset(session_id, {})
+            state = self._sessions[session_id]
         state.turn = turn
-        state.absorb(user_message)
+        try:
+            state.absorb(user_message)
+        except Exception:  # noqa: BLE001 -- a pathological message must not
+            # break the turn; slots filled on earlier turns still stand.
+            pass
 
-        recommendations = self._retrieve(state, top_k)
+        try:
+            recommendations = self._retrieve(state, top_k)
+        except Exception:  # noqa: BLE001 -- mirrors elimination/agent.py, which
+            # guards its rerank the same way: a retrieval bug costs the
+            # ordering, not the results.
+            recommendations = self._popularity_fallback(top_k)
 
         # Thin-signal guard (config.THIN_*): on an early turn with a still-
         # thin constraint signal and the simulator not yet exhausted, a
