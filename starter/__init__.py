@@ -1,2 +1,2 @@
-"""Participant starter package."""
+"""Participant agent package."""
 
