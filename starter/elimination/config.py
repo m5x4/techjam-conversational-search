@@ -3,7 +3,7 @@
 Every knob the elimination agent reads lives here, with the rationale for its
 value kept inline. ``matcher.py`` / ``session.py`` / ``agent.py`` pull these
 in with ``from .config import *`` (mirroring the lexical twin's
-``src/lexical/config.py``), so ``__all__`` below is the authoritative list.
+``starter/lexical/config.py``), so ``__all__`` below is the authoritative list.
 """
 
 from __future__ import annotations
@@ -210,7 +210,7 @@ POP_SCALE = math.log1p(100000.0)
 # of it.
 #
 # Measured, pop_w held at 0.30 (1,000-session trace; live figures in
-# EXPERIMENTS.md sec.3): the sweep peaks at 0.5 on train, holdout and both
+# starter/elimination-track.md sec.3): the sweep peaks at 0.5 on train, holdout and both
 # objectives at once, and the paired bootstrap clears zero
 # (+0.00282 raw [+0.0007,+0.0054], +0.00243 public [+0.0006,+0.0044]).
 VELOCITY_ENABLED = True

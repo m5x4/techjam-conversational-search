@@ -24,7 +24,8 @@ to the `elimination` track (the stronger overall generaliser) -- the safe
 default for a private evaluator that reworks the wording.
 
 See `C:\\Users\\xhwon\\.claude\\plans\\since-agent-is-good-peppy-journal.md`
-and `src/README.md` for the per-scenario measurements behind the split.
+and `starter/lexical-track.md` / `starter/elimination-track.md` for the per-scenario
+measurements behind the split.
 """
 
 from __future__ import annotations

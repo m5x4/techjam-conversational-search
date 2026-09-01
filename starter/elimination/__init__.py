@@ -2,10 +2,10 @@
 
 Constraint-accumulating shopping agent: hard FTS5 phrase filtering, an
 always-on diversified browse track, and dry-turn deep paging. One of the two
-implementations behind the scenario router in ``src/agent.py``; the router
+implementations behind the scenario router in ``starter/agent.py``; the router
 hands this one every Buying / Browsing / Boundary session.
 
-Module map (mirrors the lexical twin's ``src/lexical/`` layout):
+Module map (mirrors the lexical twin's ``starter/lexical/`` layout):
 
     config.py    every tuning constant, with rationale inline
     text.py      folding / tokenisation (folds differently -- not shared)

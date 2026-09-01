@@ -2,7 +2,7 @@
 
 Self-contained on purpose: this track folds text differently from the lexical
 twin (``str.casefold`` + a 180-char clip + a wider strip set), so these do
-*not* share code with ``src/lexical/text_utils.py`` -- a constraint has to
+*not* share code with ``starter/lexical/text_utils.py`` -- a constraint has to
 compare equal to the exact form the customer clipped it from.
 """
 

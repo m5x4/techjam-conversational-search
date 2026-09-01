@@ -31,7 +31,7 @@ RE_NO_PREFERENCE = re.compile(
 # "a preference for X" (no "additional") = a one-off Boundary-scenario shrug
 # that says nothing about X and just costs the session a turn. Order matters:
 # test EXHAUSTED first, since its text also satisfies the BOUNDARY pattern's
-# prefix. README: "Combined v1+v2 features" (F3, boundary slack).
+# prefix. lexical-track.md: "Combined v1+v2 features" (F3, boundary slack).
 RE_NO_PREF_EXHAUSTED = re.compile(
     r"I don't have an additional preference", re.IGNORECASE
 )
@@ -48,7 +48,7 @@ RE_GENERIC_REBUFF = re.compile(r"not quite right yet", re.IGNORECASE)
 # ("I'm looking for <cat>. <old_value>"). That last case is a real,
 # catalog-derived attribute of the target (soft_preferences[-1]) and is worth
 # capturing turn 1 instead of only reaching the rerank once the simulator
-# re-discloses it several turns later. README: "Opener trailing clause".
+# re-discloses it several turns later. lexical-track.md: "Opener trailing clause".
 RE_OPENER_TAIL = re.compile(r"^I'm looking for [^.,]+[.,]\s*(.+?)\s*$", re.IGNORECASE | re.DOTALL)
 RE_OPENER_FILLER = re.compile(r"^(?:but\s+)?I'm still exploring\b", re.IGNORECASE)
 

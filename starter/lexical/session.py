@@ -3,7 +3,7 @@
 A parsed category, a dict of attribute-keyed slots (each an ordered list of
 trusted phrases), and a broad fallback bag of every term ever seen. Ordinary
 reveals accumulate into their slot; an Intent-Override message erases and
-rewrites only the ONE slot the new value belongs to. README:
+rewrites only the ONE slot the new value belongs to. lexical-track.md:
 "Dialogue state".
 """
 
@@ -157,7 +157,7 @@ class _SessionState:
         Reinforcement rule: only re-insert (and only 2x-weight) the override
         value when it adds genuine retrieval signal -- i.e. it is NOT already
         covered verbatim by an existing phrase in its slot, AND it is a
-        multi-word / discriminating value. README: "Intent override".
+        multi-word / discriminating value. lexical-track.md: "Intent override".
         """
         new_attr = _classify(new_value)
         new_value_lower = new_value.lower().strip(" .")

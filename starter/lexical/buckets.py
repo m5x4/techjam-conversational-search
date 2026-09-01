@@ -9,7 +9,7 @@ and gives a hard recall floor.
 
 BucketIndex.resolve() degrades gracefully (exact -> containment ->
 token-overlap -> None); on None the agent falls back to the whole-catalog
-BM25 pipeline unchanged. README: "Bucket pre-filter".
+BM25 pipeline unchanged. lexical-track.md: "Bucket pre-filter".
 """
 
 from __future__ import annotations

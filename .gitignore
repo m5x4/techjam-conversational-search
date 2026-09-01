@@ -4,7 +4,7 @@ results.dev.json
 results.json
 data/
 evaluator/
-src/__pycache__
+starter/__pycache__
 README.md
-src/elimination/__pycache__/
-src/lexical/__pycache__/
+starter/elimination/__pycache__/
+starter/lexical/__pycache__

@@ -5,7 +5,7 @@ router hands this one every turn of an Intent-Override session. `Agent`
 (reset / respond) is the same interface the router and evaluator expect. The
 implementation is split across sibling modules:
 
-    config.py           tuning constants (swept; see README)
+    config.py           tuning constants (swept; see lexical-track.md)
     text_utils.py       tokenisation + normalisation helpers
     budget.py           disclosed-budget -> (operator, amount) parsing
     message_parsing.py  simulator-message regexes + constraint classification
@@ -14,7 +14,7 @@ implementation is split across sibling modules:
     catalog_index.py    BM25 (SQLite FTS5) + blob / field-value / popularity maps
 
 Strategy, tuning history and rejected experiments are written up in
-`src/README.md`.
+`starter/lexical-track.md`.
 
 Runtime overview:
   * ask_attribute emits "other" every turn until the simulator has nothing
@@ -62,7 +62,7 @@ class Agent:
         # default OFF). The other profile fields are deliberately unused:
         # `purchase_frequency` is a dataset constant, `summary` restates
         # `preference_tags`, `rating_style` is a coarser `average_prior_rating`
-        # (README: "User-profile rating affinity").
+        # (lexical-track.md: "User-profile rating affinity").
         tags = (
             user_profile.get("preference_tags")
             if isinstance(user_profile, dict)
@@ -136,8 +136,8 @@ class Agent:
         # coincidence the next "other" reveal lifts to rank 1..3. Returning
         # only THIN_KEEP ids defers that weak hit one turn; retrieval is
         # monotonic so it re-enters at the same-or-better rank -- ~1 turn of
-        # MTTC at worst, never a new miss. README: "Thin-signal guard".
-        # config.BOUNDARY_SLACK (README: "Combined v1+v2 features"): a
+        # MTTC at worst, never a new miss. lexical-track.md: "Thin-signal guard".
+        # config.BOUNDARY_SLACK (lexical-track.md: "Combined v1+v2 features"): a
         # Boundary-scenario "I don't have A preference for X" shrug discloses
         # nothing and shifts that session one turn later, so each shrug buys
         # the turn cap one more turn -- what the cap really bounds is the
@@ -155,7 +155,7 @@ class Agent:
 
         # EXPERIMENTAL post-rerank confidence gate (config.CONF_GATE_*, default
         # OFF). Defer a weak early hit when the linear-rerank score margin is
-        # thin. README: "Confidence gate".
+        # thin. lexical-track.md: "Confidence gate".
         if (
             CONF_GATE_ENABLE
             and turn <= CONF_GATE_MAX_TURN
@@ -223,7 +223,7 @@ class Agent:
         # none); it exists purely so the WHOLE bucket still rides through the
         # rerank -- the recall floor the 500-cap whole-catalog pool lacked.
         # Unresolved -> the whole-catalog pipeline runs verbatim (private-set
-        # safety net). README: "Bucket pre-filter".
+        # safety net). lexical-track.md: "Bucket pre-filter".
         bucket_ids = self._resolve_bucket(state)
         if bucket_ids is not None:
             pool = self.index.bm25_search_scoped(
@@ -240,7 +240,7 @@ class Agent:
             pool = self.index.bm25_search(and_terms, or_terms, BM25_POOL)
             # Buying trusts a thin-but-precise pool as-is; Browsing widens
             # proactively (well above bare top_k) to give the rerank more
-            # candidates to differentiate. README: "Buying vs Browsing".
+            # candidates to differentiate. lexical-track.md: "Buying vs Browsing".
             widen_threshold = (
                 top_k if state.mode == "buying" else top_k * _BROWSING_WIDEN_FACTOR
             )
@@ -254,7 +254,7 @@ class Agent:
             return []
 
         fused = self._rerank(state, pool)
-        # config.BROWSE_DIVERSITY (README: "Combined v1+v2 features"): a
+        # config.BROWSE_DIVERSITY (lexical-track.md: "Combined v1+v2 features"): a
         # no-constraint Browsing turn has nothing to rank on, so ten
         # near-neighbours all teach the same thing. Spread the head across
         # distinct stores / title-shapes before _window slices it, so the
@@ -314,7 +314,7 @@ class Agent:
 
         A known hard-budget ("<"/">") price violation still demotes a
         candidate regardless of score: _price_rank_map is applied last as a
-        stable sort. README: "Linear rerank".
+        stable sort. lexical-track.md: "Linear rerank".
         """
         if not pool:
             state.last_rerank_tie_count = 0
@@ -339,7 +339,7 @@ class Agent:
         # SYNTH_RESCUE_MAX_DF_FRAC of the pool. A near-universal value
         # ("color: black", "department: womens") stays dropped: crediting it
         # just shifts ties toward the popular decoys that also carry it.
-        # README: "Synthetic phrase / real field value".
+        # lexical-track.md: "Synthetic phrase / real field value".
         rescued: set[str] = set()
         if SYNTH_RESCUE_MAX_DF_FRAC > 0.0:
             synth = [c for c in constraints if _SYNTHETIC_PHRASE_RE.match(c)]
@@ -372,14 +372,14 @@ class Agent:
         # gated to priors below PRIOR_RATING_MAX (shipped 5.1 -> every rating;
         # 5.0 was tested and is worse -- see config). Unrated items (rating
         # 0.0) are neutral. Score-only: evidence / tie-count are untouched.
-        # README: "User-profile rating affinity".
+        # lexical-track.md: "User-profile rating affinity".
         prior_rating = state.prior_rating
         use_prior = (
             PRIOR_RATING_W > 0.0
             and prior_rating is not None
             and prior_rating < PRIOR_RATING_MAX
         )
-        # Ported from agent_v2.py (README: "Combined v1+v2 features"). Both
+        # Ported from agent_v2.py (lexical-track.md: "Combined v1+v2 features"). Both
         # are score-only additive terms -- evidence / tie-count untouched --
         # and both are inert at their config default of 0.0.
         #   POSITION_W: reward a disclosed constraint that lands on an early
@@ -451,7 +451,7 @@ class Agent:
         price that VIOLATES it. None when there is no hard ("<"/">") budget in
         play. Comparisons are inclusive + PRICE_TOL: the disclosed amount is
         the target's own price, so a strict bound would demote the real
-        target. README: "Structured price split"."""
+        target. lexical-track.md: "Structured price split"."""
         if not PRICE_HARD_SPLIT:
             return None
         op = state.budget_op
@@ -475,7 +475,7 @@ class Agent:
         """Normally return fused[:top_k]. Once the session has dead-ended
         (state.exhausted) and the list has been shown once unchanged, rotate
         deeper candidates through the tail slots so later turns keep probing
-        instead of re-showing an identical miss. README: "Post-exhaustion
+        instead of re-showing an identical miss. lexical-track.md: "Post-exhaustion
         rotation"."""
         if not state.exhausted:
             return fused[:top_k]
@@ -503,7 +503,7 @@ class Agent:
             # purchase target tends to be a quirky, lightly-reviewed item that
             # the evidence+popularity fused order buries. Surfacing the
             # least-reviewed tied candidates first gives it earlier rotation
-            # shots. (Descending popularity was tried and rejected -- README.)
+            # shots. (Descending popularity was tried and rejected -- lexical-track.md.)
             rotation_pool.sort(
                 key=lambda pid: self.index.popularity.get(pid, 0.0)
             )

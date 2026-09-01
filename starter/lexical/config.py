@@ -1,16 +1,16 @@
 """Tuning constants for the conversational-search agent.
 
 Every value here was swept against the 200-sample public set. The rationale,
-sweep grids and rejected alternatives are written up in ``src/README.md``
+sweep grids and rejected alternatives are written up in ``starter/lexical-track.md``
 (sections referenced from the inline notes below) rather than repeated here.
 
 The sweep scripts under ``scripts/`` mutate these names on the imported
-``src.lexical.agent`` module at runtime (``agent_mod.THIN_KEEP = ...``); the
+``starter.lexical.agent`` module at runtime (``agent_mod.THIN_KEEP = ...``); the
 agent re-exports them with ``from .config import *`` and reads them as bare
-module globals, so a reassignment on ``src.lexical.agent`` is picked up on
+module globals, so a reassignment on ``starter.lexical.agent`` is picked up on
 the next call. Constants consumed inside ``catalog_index.py`` (the FTS5 term
 caps) are read from this module directly -- point ``sweep_weight.py`` at
-``src.lexical.config`` to sweep those.
+``starter.lexical.config`` to sweep those.
 """
 
 from __future__ import annotations
@@ -62,11 +62,11 @@ OR_TERM_CAP = 60
 # parent_asin is UNINDEXED so its weight is inert (kept as 0.0 for a
 # 1:1 map to the column list). Read inside catalog_index.py; used for BOTH
 # the whole-catalog and the bucket-scoped query. Hand-set originally, then
-# swept against the bucket pools. README: "BM25 column weights".
+# swept against the bucket pools. lexical-track.md: "BM25 column weights".
 BM25_COLUMN_WEIGHTS = (0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0)
 
 # Browsing sessions widen the BM25 pool well before it runs dry (see
-# Agent._retrieve). README: "Buying vs Browsing routing".
+# Agent._retrieve). lexical-track.md: "Buying vs Browsing routing".
 _BROWSING_WIDEN_FACTOR = 3
 
 # --- Linear rerank weights (the single active scoring pass) ---------------
@@ -76,7 +76,7 @@ _BROWSING_WIDEN_FACTOR = 3
 #                         of this item's flattened blob)
 #            + POP_W   * (popularity(pid) / max popularity in the pool)
 #            - RANK_W  * (pool_position / len(pool))
-# Swept against the category-pure bucket pools (README: "Rerank weight
+# Swept against the category-pure bucket pools (lexical-track.md: "Rerank weight
 # sweep"). A ~140-point grid has a broad flat optimum: every point with
 # LOOSE_W >= EXACT_W, LOOSE_W in [1.0, 1.5], POP_W in [0.3, 0.9] and
 # RANK_W in [0.05, 0.10] lands on the SAME session outcomes -- public
@@ -94,11 +94,11 @@ RANK_W = 0.10
 # Post-exhaustion "stall rotation": once the simulator has nothing left to
 # reveal and the target still isn't in the top_k, pin the strongest
 # (TOP_K - ROTATE_WINDOW) slots and cycle deeper candidates through the rest
-# each turn. README: "Post-exhaustion rotation".
+# each turn. lexical-track.md: "Post-exhaustion rotation".
 ROTATE_WINDOW = 5
 ROTATE_BY_POPULARITY = False
 # Order the post-exhaustion rotation pool least-reviewed-first. Mutually
-# exclusive with ROTATE_BY_POPULARITY (which takes precedence). README:
+# exclusive with ROTATE_BY_POPULARITY (which takes precedence). lexical-track.md:
 # "Post-exhaustion rotation".
 ROTATE_NOVELTY_FIRST = False
 
@@ -108,7 +108,7 @@ ROTATE_NOVELTY_FIRST = False
 # signal (<= THIN_PHRASE_MAX verbatim multi-word phrases) and the simulator
 # not yet exhausted, return only THIN_KEEP ids. Retrieval is monotonic so
 # the target re-enters at the same-or-better rank next turn.
-# README: "Thin-signal guard". scripts/sweep_thin.py reproduces the sweep.
+# lexical-track.md: "Thin-signal guard". scripts/sweep_thin.py reproduces the sweep.
 THIN_ENABLE = True
 THIN_KEEP = 1
 THIN_MAX_TURN = 3
@@ -125,7 +125,7 @@ THIN_PHRASE_MAX = 2
 # With Dive Flag", "Material: Pleuche"). A near-universal one ("color: black",
 # "department: womens") stays dropped: crediting it only shifts ties toward
 # the popular decoys that also carry it. 0.0 disables the rescue entirely.
-# README: "Synthetic phrase / real field value".
+# lexical-track.md: "Synthetic phrase / real field value".
 SYNTH_RESCUE_MAX_DF_FRAC = 0.30
 
 # EXPERIMENTAL post-rerank confidence gate. Default OFF -- baseline
@@ -134,7 +134,7 @@ SYNTH_RESCUE_MAX_DF_FRAC = 0.30
 # linear-rerank score margin instead of THIN's turn/phrase-count heuristic:
 # when the leader is not >= CONF_GATE_RATIO x the tail score, trim to
 # CONF_GATE_KEEP ids. Only fires on turn <= CONF_GATE_MAX_TURN while the
-# simulator still has more to disclose. README: "Confidence gate".
+# simulator still has more to disclose. lexical-track.md: "Confidence gate".
 CONF_GATE_ENABLE = False
 CONF_GATE_RATIO = 1.5
 CONF_GATE_MAX_TURN = 3
@@ -146,7 +146,7 @@ CONF_GATE_KEEP = 1
 # evaluator ("keep it under $30"): a candidate whose KNOWN price violates
 # the bound sorts after every candidate that satisfies it; a candidate with
 # no price is not penalised. Comparisons are inclusive + PRICE_TOL because
-# the amount is the target's own price. README: "Structured price split".
+# the amount is the target's own price. lexical-track.md: "Structured price split".
 PRICE_HARD_SPLIT = True
 PRICE_TOL = 0.01
 
@@ -175,7 +175,7 @@ PRICE_TOL = 0.01
 # = 5.0` (gate out prior = 5.0 users) was tested and is *worse* -- a prior-5.0
 # user whose target is itself 5.0-rated takes zero penalty while the mid-rated
 # decoys above it are demoted, so the shipped 5.1 keeps the gate open for
-# every rating. README: "User-profile rating affinity".
+# every rating. lexical-track.md: "User-profile rating affinity".
 #
 # REVERTED to 0.0 (2026-09-01). The W = 0.15 gain was measured only on the
 # 200-sample public set (+0.00122 composite, +0.0001 on its 50-session val
@@ -188,7 +188,7 @@ PRICE_TOL = 0.01
 PRIOR_RATING_W = 0.0
 PRIOR_RATING_MAX = 5.1
 
-# --- Ported from the standalone agent_v2.py (README: "Combined v1+v2
+# --- Ported from the standalone agent_v2.py (lexical-track.md: "Combined v1+v2
 # features"). Four candidate levers, each gated here and inert at its no-op
 # default. The backing per-product data (field_pos map, velocity map,
 # store/title maps) is built unconditionally in catalog_index.py -- only the
@@ -203,7 +203,7 @@ PRIOR_RATING_MAX = 5.1
 # deep ("...ships with a nylon carry bag") is incidental. Score-only, added
 # to _rerank as POSITION_W * 1/(1 + earliest_entry_index). This is a signal
 # outside the disclosed text's mere presence/absence -- the one kind
-# README's "six-session data-ambiguity dead end" leaves open. 0.0 disables.
+# lexical-track.md's "six-session data-ambiguity dead end" leaves open. 0.0 disables.
 #
 # SHIPPED at 0.2. Public sweep {0.1 .. 0.5}: interior peak at 0.2 (composite
 # +0.0002, MTTC only) -- noise-band on its own. But it GENERALISES: on the
@@ -212,7 +212,7 @@ PRIOR_RATING_MAX = 5.1
 # not just MTTC), hit-rate flat, 22 sessions moved, 0 regressions; buying
 # MRR +0.0036, intent_override +0.0042, boundary / browsing untouched.
 # Bigger on held-out than on the tuning set -- the opposite of the
-# PRIOR_RATING_W failure. README: "Combined v1+v2 features".
+# PRIOR_RATING_W failure. lexical-track.md: "Combined v1+v2 features".
 POSITION_W = 0.2
 
 # F2 -- ratings velocity: rating_number normalised by listing age, added

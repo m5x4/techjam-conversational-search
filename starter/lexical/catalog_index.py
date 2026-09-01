@@ -5,7 +5,7 @@ map.
 
 No ML / embedding dependency -- the agent runs fully offline. A dense
 bi-encoder route and a local-LLM reranker were both prototyped on top of the
-old fuse and empirically rejected (README: "Rejected approaches").
+old fuse and empirically rejected (lexical-track.md: "Rejected approaches").
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def listed_year(details: object) -> int | None:
 
 def _bm25_expr() -> str:
     """`bm25(products, w0, w1, ...)` built from config.BM25_COLUMN_WEIGHTS at
-    call time -- so a sweep that reassigns src.lexical.config.BM25_COLUMN_WEIGHTS
+    call time -- so a sweep that reassigns starter.lexical.config.BM25_COLUMN_WEIGHTS
     is picked up on the next query without an index rebuild."""
     weights = ", ".join(repr(float(w)) for w in config.BM25_COLUMN_WEIGHTS)
     return f"bm25(products, {weights})"

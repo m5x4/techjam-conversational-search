@@ -1,7 +1,7 @@
 """Lexical retrieval track -- the Intent-Override route.
 
 bucket pre-filter -> two-tier BM25 -> linear rerank -> window. One of the two
-implementations behind the scenario router in ``src/agent.py``; the router
+implementations behind the scenario router in ``starter/agent.py``; the router
 hands this one every turn of an Intent-Override session.
 
 Module map:
