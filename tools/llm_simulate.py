@@ -63,8 +63,8 @@ def install_probes() -> None:
     original_browse = Matcher.browse
     original_reveal = Agent._reveal
 
-    def features(self, pool, evidence):
-        rows = original_features(self, pool, evidence)
+    def features(self, pool, evidence, *args, **kwargs):
+        rows = original_features(self, pool, evidence, *args, **kwargs)
         weights = A.rerank_weights()
         _CAPTURE["totals"] = {
             asin: sum(weight * value for weight, value in zip(weights, row))
@@ -72,8 +72,8 @@ def install_probes() -> None:
         }
         return rows
 
-    def rerank(self, pool, evidence, top_k, offset=0, weights=None):
-        slate, info = original_rerank(self, pool, evidence, top_k, offset, weights)
+    def rerank(self, pool, evidence, top_k, offset=0, weights=None, **kwargs):
+        slate, info = original_rerank(self, pool, evidence, top_k, offset, weights, **kwargs)
         _CAPTURE["slate"] = list(slate)
         _CAPTURE["tied"] = info.get("tied", 0)
         return slate, info

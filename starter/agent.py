@@ -311,14 +311,15 @@ RERANK_WEIGHTS = (1.5, 0.6, 0.3, 0.10)
 # is what makes the ranking tunable offline: tools/tune_reranker.py caches
 # these rows once and re-scores them under candidate weights without going near
 # sqlite again.
-FEATURE_NAMES = ("exact", "loose", "position", "popularity", "velocity", "bm25")
+FEATURE_NAMES = ("exact", "loose", "position", "popularity", "velocity", "tags", "bm25")
 
 
 def rerank_weights() -> tuple[float, ...]:
     """The live weight vector, in FEATURE_NAMES order."""
     exact_w, loose_w, pop_w, rank_w = RERANK_WEIGHTS
     velocity_w = VELOCITY_W if VELOCITY_ENABLED else 0.0
-    return (exact_w, loose_w, POSITION_W, pop_w, velocity_w, rank_w)
+    tags_w = TAGS_W if TAGS_ENABLED else 0.0
+    return (exact_w, loose_w, POSITION_W, pop_w, velocity_w, tags_w, rank_w)
 
 # The customer clips each disclosed constraint at this many characters, so the
 # catalog side is clipped identically -- otherwise a truncated constraint could
@@ -371,6 +372,75 @@ VELOCITY_W = 0.5
 VELOCITY_FLOOR_YEAR = 2008
 VELOCITY_NOW = 2024
 YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+
+# Preference tags: the only field of `user_profile` with any variance left
+# (`purchase_frequency` is one constant string across the whole public set,
+# `rating_style` is a strict 3-bucket coarsening of `average_prior_rating`, and
+# `summary` restates both). They arrive as generic single words -- fit,
+# material, comfort, style -- so they are used as a low-weight OR bag over the
+# candidate's text, never as a filter: an item matching more of what the
+# shopper's history emphasised scores slightly higher, and nothing is ever
+# excluded for matching none.
+#
+# Score-only, like popularity and velocity. It does not enter `decisive`, so
+# the evidence-tie count -- which is what the exposure gate and the two trimmed
+# prompts read -- is untouched.
+#
+# *Measured, and off.* The marginal prior is real -- a target carries 44.5% of
+# its shopper's tags against 26.5% for the average catalog row, which puts the
+# target at the 67th percentile catalog-wide, a stronger lift than the
+# `average_rating` prior of sec.3. It is worth nothing in the pool. Over the
+# 51,008 candidates that actually compete with a target in the 1,000-session
+# trace, the tag delta is +0.0038 in the *rival's* favour: a rival out-scores
+# the target on tags 35.3% of the time and loses 29.0%, against popularity's
+# 6.8/93.1. The sweep decays monotonically from w = 0.02 upward on train,
+# holdout and both objectives at once (sec.8). This is the sec.3 recency
+# failure exactly: the filter has already selected for items whose text
+# discusses fit and material, so what the bag measures inside the pool is
+# listing verbosity.
+#
+# Left switchable rather than deleted because a private evaluator may populate
+# `preference_tags` with something specific rather than the eight generic words
+# the public set uses, and that is a different feature with the same plumbing.
+# ENABLED = False empties the bag, which makes the column constant -- restoring
+# the ranking *and* the trace's dominance pruning (35,296 carried rows, against
+# 51,008 with a live bag at w = 0.0, a 45% tuning tax paid for nothing).
+TAGS_ENABLED = False
+TAGS_W = 0.0
+# Fraction of the profile's tags present rather than the raw count, so the
+# feature lands in [0, 1] alongside popularity and velocity and its weight
+# means the same thing for a 2-tag profile as for a 5-tag one.
+TAGS_NORMALIZE = True
+# Whether a tag has to land on a whole word. Substring is the house idiom for a
+# bare attribute word (`_matches` tests colour and material the same way), but
+# it also lets "fit" collect "outfit" and "benefit", so the stricter form is
+# kept switchable and was measured against it.
+TAGS_WORD_BOUNDARY = False
+_TAG_PATTERNS: dict[str, "re.Pattern[str]"] = {}
+
+
+def tag_present(tag: str, text: str) -> bool:
+    if not TAGS_WORD_BOUNDARY:
+        return tag in text
+    pattern = _TAG_PATTERNS.get(tag)
+    if pattern is None:
+        pattern = re.compile(r"(?<!\w)" + re.escape(tag) + r"(?!\w)")
+        _TAG_PATTERNS[tag] = pattern
+    return pattern.search(text) is not None
+
+
+def profile_tags(profile: dict) -> tuple[str, ...]:
+    """The preference tags, folded to the form `Matcher.text` is stored in.
+
+    Deduplicated and order-preserving. Anything that is not a non-empty string
+    is dropped: a private evaluator phrasing the profile differently must
+    degrade to an empty bag, which is exactly TAGS_W = 0.
+    """
+    raw = (profile or {}).get("preference_tags") or []
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    folded = (normalize(tag) for tag in raw if isinstance(tag, str) and tag.strip())
+    return tuple(dict.fromkeys(tag for tag in folded if tag))
 
 
 def listed_year(details: object) -> int | None:
@@ -692,7 +762,7 @@ class Matcher:
         return None
 
     def features(
-        self, pool: list[str], evidence: list[str]
+        self, pool: list[str], evidence: list[str], tags: tuple[str, ...] = ()
     ) -> list[tuple[float, ...]]:
         """One row per candidate, in FEATURE_NAMES order: every signal the
         reranker has, before any weight is applied.
@@ -709,6 +779,13 @@ class Matcher:
         """
         constraints = [norm for norm in (normalize(item) for item in evidence) if norm]
         constraints = list(dict.fromkeys(constraints))
+        # A tag the shopper has already quoted as a constraint is not a second,
+        # independent reason to prefer an item -- it is the same string, and
+        # counting it twice would let the tag bag amplify evidence it does not
+        # own. Evidence keeps it; the bag drops it.
+        bag = [tag for tag in (tags if TAGS_ENABLED else ())
+               if not any(tag in constraint for constraint in constraints)]
+        scale = float(len(bag)) if (bag and TAGS_NORMALIZE) else 1.0
         depth = len(pool) or 1
         rows: list[tuple[float, ...]] = []
         for position, asin in enumerate(pool):
@@ -724,12 +801,15 @@ class Matcher:
                     index = self._position(constraint, asin)
                     if index is not None and (earliest is None or index < earliest):
                         earliest = index
+            text = self.text.get(asin, "")
+            hits = sum(1.0 for tag in bag if tag_present(tag, text))
             rows.append((
                 exact,
                 loose,
                 0.0 if earliest is None else 1.0 / (1.0 + earliest),
                 self.pop.get(asin, 0.0),
                 self.velocity.get(asin, 0.0),
+                hits / scale,
                 -(position / depth),
             ))
         return rows
@@ -771,6 +851,7 @@ class Matcher:
         top_k: int,
         offset: int = 0,
         weights: tuple[float, ...] | None = None,
+        tags: tuple[str, ...] = (),
     ) -> list[str]:
         """Order a candidate pool by everything the customer has disclosed.
 
@@ -793,8 +874,8 @@ class Matcher:
         if not RERANK_ENABLED or not pool:
             return pool[offset:offset + top_k], {"tied": len(pool)}
         (exact_w, loose_w, position_w, pop_w,
-         velocity_w, rank_w) = weights or rerank_weights()
-        rows = self.features(pool, evidence)
+         velocity_w, tags_w, rank_w) = weights or rerank_weights()
+        rows = self.features(pool, evidence, tags)
 
         # Evidence is scored on its own pass rather than inline with the
         # tie-breakers, because how many candidates share the best evidence
@@ -817,7 +898,8 @@ class Matcher:
         # same sign and the score is a dot product end to end.
         totals = [
             earned[index] + placement[index]
-            + pop_w * row[3] + velocity_w * row[4] + rank_w * row[5]
+            + pop_w * row[3] + velocity_w * row[4] + tags_w * row[5]
+            + rank_w * row[6]
             for index, row in enumerate(rows)
         ]
         ordered = sorted(range(len(pool)), key=lambda index: (-totals[index], index))
@@ -1004,11 +1086,13 @@ NARROW_PROMPT = (
 
 
 class SessionState:
-    __slots__ = ("profile", "category", "constraints", "heard", "asked", "last_ask",
-                 "gained", "exhausted", "intent", "dry", "slack")
+    __slots__ = ("profile", "tags", "category", "constraints", "heard", "asked",
+                 "last_ask", "gained", "exhausted", "intent", "dry", "slack")
 
     def __init__(self, profile: dict) -> None:
         self.profile = profile or {}
+        # Fixed for the session, so folded once here rather than per turn.
+        self.tags = profile_tags(self.profile)
         # Routed on the opening turn: a shopper who leads with a requirement is
         # buying, one who leads with only a category is browsing.
         self.intent: str | None = None # "buying" or "browsing" or "intent_override"
@@ -1274,7 +1358,7 @@ class Agent:
             )
             try:
                 recommendations, ranking = self.matcher.rerank(
-                    pool, state.heard, top_k, offset
+                    pool, state.heard, top_k, offset, tags=state.tags
                 )
             except Exception:
                 # The evaluator discards the whole turn if respond() raises, so

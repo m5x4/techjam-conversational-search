@@ -97,19 +97,19 @@ def install_probes() -> None:
     original_rerank = Matcher.rerank
     original_reveal = Agent._reveal
 
-    def features(self, pool, evidence):
-        rows = original_features(self, pool, evidence)
+    def features(self, pool, evidence, *args, **kwargs):
+        rows = original_features(self, pool, evidence, *args, **kwargs)
         _CAPTURE["pool"] = list(pool)
         _CAPTURE["rows"] = rows
         return rows
 
-    def rerank(self, pool, evidence, top_k, offset=0, weights=None):
+    def rerank(self, pool, evidence, top_k, offset=0, weights=None, **kwargs):
         # Mirrors the clamp in rerank(). If that ever drifts, --verify fails on
         # the first session rather than quietly tuning against a fiction.
         _CAPTURE["offset"] = max(
             0, min(offset if DEEP_PAGING else 0, max(0, len(pool) - top_k))
         )
-        return original_rerank(self, pool, evidence, top_k, offset, weights)
+        return original_rerank(self, pool, evidence, top_k, offset, weights, **kwargs)
 
     def reveal(*args, **kwargs):
         value = original_reveal(*args, **kwargs)

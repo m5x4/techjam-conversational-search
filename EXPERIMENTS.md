@@ -367,7 +367,7 @@ decomposition should not be read as a finding — only the aggregate replicates.
 **The one thing that is consistent across every scenario on both sets is MTTC: it
 improves or holds, and never worsens** (public 1.637→1.538, 2.225→2.188; dev 3.425→3.275,
 2.341→2.291, 1.769→1.722). MRR moves in both directions depending on the slice. That
-matches §8 — the remaining headroom was Efficiency, and this feature converts earlier
+matches §9 — the remaining headroom was Efficiency, and this feature converts earlier
 rather than ranking better, which is where the points actually were.
 
 The generalisable point, against the reverted provenance features directly above: those
@@ -460,7 +460,7 @@ layer existed (0.9670, 0 tokens).
 
 ### The ceiling that motivated it
 
-§8 says the remaining headroom is Efficiency — turn-1 conversion — so the question
+§9 says the remaining headroom is Efficiency — turn-1 conversion — so the question
 worth asking is how much of it a better top-1 could reach. Instrumenting `rerank` to
 record the untrimmed slate on every turn answers it exactly. Over the public set, the
 earliest turn the target appears anywhere in the reranked top 10:
@@ -678,6 +678,13 @@ accounting) is left in place but inert.
 **Provenance features** (`Date First Available`, `average_rating`, store name) — built,
 measured, reverted (§3). Real catalog-wide priors, no value inside a tie group.
 
+**User-profile rating affinity** (`|average_rating − average_prior_rating|`) — rejected
+without building (§8). On the 134/200 sessions with a prior of 5.0 it is ordinally
+identical to the `average_rating` feature already reverted above; elsewhere it is noise.
+
+**Preference tags as a low-weight OR bag** — built, measured, shipped off (§8). A real
+67th-percentile catalog-wide prior that is a coin flip inside the pool.
+
 **LLM reranking of the top 10** — built, measured, shipped off (§6). End to end it costs
 **−0.0058** (0.9670 → 0.9611), all of it Efficiency; hit rate holds at exactly 1.000,
 which is the permutation invariant doing its job. Blending the model in as a weighted
@@ -685,7 +692,104 @@ which is the permutation invariant doing its job. Blending the model in as a wei
 weight is zero. The tie groups it was meant to break are information-free, not
 mis-ranked.
 
-## 8. Where the remaining headroom is
+**Per-scenario reranker weights** — measured, rejected (§10). Fitting one weight vector
+per scenario and routing each session to its own is worth +0.0004 across four holdout
+cuts, and every refit — routed or global — scores below the shipped weights out of
+sample.
+
+## 8. Preference tags as a low-weight OR bag — *built, measured, off*
+
+`user_profile` reaches `reset()` and, until this experiment, nothing read a single field
+of it. A field-by-field audit says only two carry information at all: `purchase_frequency`
+is the string `"3-4 prior purchases"` on 200/200 public sessions, `rating_style` is a
+strict function of `average_prior_rating` (1/2/3 → critical, 4 → mixed, 5 → usually
+positive, verified on all 200), and `summary` restates both. That leaves
+`average_prior_rating` and `preference_tags`.
+
+**`average_prior_rating` was rejected without building it.** The proposal is to penalise
+a candidate whose catalog `average_rating` diverges from the shopper's prior. 134 of the
+200 public sessions have a prior of exactly 5.0 and no catalog row is rated above 5.0, so
+on two-thirds of the set `−|r − 5.0|` is *monotone increasing in r* — ordinally identical
+to the `quality` feature already measured at +0.00059 (CI [−0.0006, +0.0022], noise) and
+reverted in sec.3. On the other 66 sessions it carries nothing: mean catalog percentile of
+the target is 0.471 / 0.471 / 0.450 / 0.569 for priors 1/2/3/4, against 0.500 for a
+feature with no signal. `r(prior, target average_rating) = 0.182` but the per-prior target
+means are non-monotone (prior 1.0 → 4.393, prior 3.0 → 4.300, prior 5.0 → 4.413, catalog
+mean 4.087), so there is no affinity to exploit — only the weak "targets are rated above
+catalog average" prior that sec.3 already priced at zero.
+
+**`preference_tags` was built.** `TAGS_ENABLED` / `TAGS_W` / `TAGS_NORMALIZE`, spliced
+into `FEATURE_NAMES` ahead of BM25 (which must stay last for the dominance pruning). The
+feature is the fraction of the shopper's tags present in the candidate's text, score-only,
+excluded from `decisive` so the tie count the exposure gate reads is untouched. Tags the
+shopper has already quoted as a constraint are dropped from the bag — evidence already
+owns those, and counting them twice would let the bag amplify a signal it did not earn.
+
+The marginal prior is real, and better than the `average_rating` one that motivated sec.3's
+provenance entry:
+
+| | target | average catalog row |
+| --- | --- | --- |
+| fraction of the shopper's tags present | 0.445 | 0.265 |
+
+which puts the target at the **67th percentile** of the catalog. Coverage is broad —
+`fit` appears in 16,930 of 50,000 rows, `material` 13,008, `comfort` 15,873, `style`
+14,260; `durability` 1,963, `performance` 2,572, `weather` 1,644, `warmth` 875.
+
+It is worth nothing in the pool, and the trace says why before any weight is chosen.
+Rival-minus-target deltas over the 51,008 candidates that survive dominance pruning
+(1,000 sessions = dev-800 + public-200):
+
+| feature | mean delta | rival beats target | target beats rival | equal |
+| --- | --- | --- | --- | --- |
+| popularity | −0.3441 | 6.8% | 93.1% | 0.1% |
+| velocity | −0.3194 | 6.4% | 93.5% | 0.0% |
+| **tags** | **+0.0038** | **35.3%** | **29.0%** | 35.8% |
+
+A coin flip leaning the wrong way. The sweep follows, monotone from the smallest weight
+tested, on every split and both objectives:
+
+| `TAGS_W` | raw all | raw train | raw holdout | public all | public train | public holdout |
+| --- | --- | --- | --- | --- | --- | --- |
+| **0.00** | **0.960758** | **0.959394** | **0.963768** | **0.964440** | **0.963851** | **0.965723** |
+| 0.02 | 0.960099 | 0.958682 | 0.963223 | 0.963862 | 0.963236 | 0.965226 |
+| 0.05 | 0.959660 | 0.958426 | 0.962383 | 0.963439 | 0.962870 | 0.964680 |
+| 0.10 | 0.959357 | 0.957713 | 0.962983 | 0.963280 | 0.962327 | 0.965356 |
+| 0.20 | 0.958950 | 0.957492 | 0.962166 | 0.963147 | 0.962512 | 0.964532 |
+| 0.40 | 0.956428 | 0.954756 | 0.960113 | 0.960317 | 0.959505 | 0.962088 |
+| 1.00 | 0.947817 | 0.947502 | 0.948511 | 0.951945 | 0.951734 | 0.952406 |
+
+**Word-boundary matching does not rescue it.** Substring lets `fit` collect `outfit` and
+`benefit`, so `TAGS_WORD_BOUNDARY` was added and the whole trace recaptured. It cleans the
+delta up — +0.0038 → −0.0071, i.e. marginally in the target's favour — and changes nothing:
+every weight still loses on `all` and on `train` (0.960758 → 0.960114 at 0.02, 0.959415 at
+0.15, 0.951139 at 1.00). Holdout shows a lone +0.0007 bump at w = 0.20 with train −0.0018
+underneath it, which is what holdout noise looks like.
+
+**Why the public 200 disagrees, and why it is wrong.** Run end to end on the public set
+alone, `TAGS_W = 0.05` scores 0.96778 against a 0.96695 baseline — +0.0008, all of it MRR,
+MTTC unchanged. Five sessions move at that weight and the delta is one of them:
+`public_0145` goes rank 2 → 1, worth 0.3 × 0.5/200 = 0.00075. `public_0144` contributes
+5 → 4 (0.00004); `public_0032`, `public_0106` and `public_0174` are turn churn that nets
+to zero. The neighbouring grid points are +0.00008 (0.02), −0.00005 (0.08) and −0.0008
+(0.10), and by 0.08 it has started giving sessions back (`public_0052` rank 1 → 2,
+`public_0099` 3 → 4). A single unflanked bump on 200 sessions against a monotone decay on
+1,000 is a coin landing. **This is the diagnostic worth keeping from the whole
+experiment**: any candidate feature should be asked for its rival-minus-target delta
+distribution on the trace *before* it is scored, because that table predicted the sweep
+and the public set did not.
+
+**Shipped `TAGS_ENABLED = False`, not deleted.** The public set populates
+`preference_tags` with eight generic words; a private evaluator that put something specific
+there would be a different feature on the same plumbing. Turning the flag off empties the
+bag, which makes the column constant — restoring the ranking exactly (per-session
+identical to `results.json`, 0.966954) *and* the trace's dominance pruning. That second
+part is not free: a live bag at `TAGS_W = 0.0` still carries 51,008 candidate rows against
+the baseline's 35,296, a 45% tax on every future tuning run for a weight of zero. Same
+reasoning that reverted the provenance features in sec.3, same fix as the sec.6 LLM
+reranker — the code stays, the flag is off.
+
+## 9. Where the remaining headroom is
 
 At 0.9670 public with hit rate 1.000 and MRR 0.969, ~0.033 remains and **~0.024 of it is
 Efficiency** — converting on turn 1 instead of turns 2–3. Recall is done; ranking is
@@ -704,6 +808,14 @@ in the session at all. Before building anything aimed at this headroom, check on
 decision set (`tools/llm_bench.py capture`) whether the sessions it targets are actually
 separable; §6 is the record of what happens when they are not.
 
+**The weights themselves are bounded far more tightly than that.** §10 prices a
+per-session oracle over weight vectors — every session ordered as well as any
+non-negative vector could order it — at **+0.0091** over the pooled 1,000 sessions
+(+0.0076 on public), with hit rate unchanged. Any reranker change that only moves
+weights, including one vector per scenario, is competing for less than a point; the
+remaining headroom is in turn policy and in what the slate is built from, not in how it
+is scored.
+
 **Caveat when comparing any two runs.** `Matcher.features()` emits the incoming BM25
 rank as `-(position / depth)` with `depth = len(pool)`, so that feature is scaled by how
 large the candidate pool happens to be. Any retrieval change that shrinks the pool — the
@@ -712,6 +824,94 @@ silently changes that feature's effective weight even though no weight was touch
 Re-run `tools/tune_reranker.py` after a retrieval change before treating the measured
 delta as final. (The bucket prefilter's +0.0051 on dev-800 was measured against weights
 tuned *without* it, so it is probably an underestimate.)
+
+## 10. Per-scenario reranker weights — *measured, rejected*
+
+One weight vector per `scenario_type`, each session routed to its own, instead of the
+single global vector. Traced fresh off the current tree (`trace` over public-200 +
+dev-800 = 1,000 sessions, 2,793 verified turns, **0 mismatched**, 35,296 carried
+candidate rows, live replay 0.960758 raw), then fitted on the train split and scored on
+the holdout it never selected on, under four `--split-salt` cuts. The fit is
+`tune_reranker`'s own machinery — `build_splits`, then 500 random probes plus three
+coordinate-descent refinements — run once over all training sessions and once over each
+scenario's slice of them, so the two arms differ only in what they were fitted on:
+
+| salt | live weights | one global refit | per-scenario routed | routed − global |
+| --- | --- | --- | --- | --- |
+| a | **0.965254** | 0.960806 | 0.959740 | −0.00107 |
+| b | **0.967087** | 0.966183 | 0.964153 | −0.00203 |
+| c | **0.964937** | 0.960069 | 0.964899 | +0.00483 |
+| d | **0.965187** | 0.964017 | 0.963876 | −0.00014 |
+
+Routing is +0.0004 on average and positive on one salt in four. The louder result is the
+first column: **the shipped weights beat both refits on every cut.** The search already
+overfits with six free weights at this sample size, and four vectors is four times the
+parameters against the same evidence. Salt c's apparent win is mostly Boundary, fitted
+on ~15 training sessions and scored on 6.
+
+Three reasons there was nothing to find, each worth reusing before the next variant of
+this idea:
+
+**The whole weight axis is nearly exhausted.** A *per-session* oracle over weights —
+each session ordered as well as any non-negative vector could order it, which is
+strictly more powerful than any router and not reachable by one — is worth +0.0091:
+
+| slice | n | live | per-session oracle | ceiling |
+| --- | --- | --- | --- | --- |
+| all | 1,000 | 0.960758 | 0.969867 | **+0.00911** |
+| buying | 400 | 0.971736 | 0.983950 | +0.01221 |
+| browsing | 400 | 0.961160 | 0.969127 | +0.00797 |
+| intent_override | 150 | 0.936600 | 0.942152 | +0.00555 |
+| boundary | 50 | 0.942200 | 0.946267 | +0.00407 |
+| public-200 | 200 | 0.966954 | 0.974575 | +0.00762 |
+| dev-800 | 800 | 0.959210 | 0.968690 | +0.00948 |
+
+Hit rate is 0.9990 under the oracle too — identical to live. It is MRR 0.9553 → 0.9748
+and MTTC 2.27 → 2.10, and no scenario has a materially larger reachable gap than the
+others. This is a much tighter bound than §9's: it prices *every remaining weight
+change*, global or routed, at under a point.
+
+**The effective sample size collapses per scenario.** Only 500 of the 1,000 sessions
+contain a turn any weight can decide at all; the rest are traced as constants because
+the target wins or loses regardless.
+
+| scenario | sessions | weight-decidable | contested rows |
+| --- | --- | --- | --- |
+| buying | 400 | 261 (65%) | 13,725 |
+| browsing | 400 | 185 (46%) | 18,008 |
+| intent_override | 150 | 35 (23%) | 585 |
+| boundary | 50 | 19 (38%) | 2,978 |
+
+After the 80/20 split that is ~28 Override and ~15 Boundary sessions to fit six weights
+against a step-function objective. (Override's count fell from 123 to 35 when
+`OVERRIDE_RESETS = False` landed in §5 — keeping the constraints means the target now
+usually wins outright.)
+
+**A feature that is inert in a scenario constrains nothing, so one vector already serves
+both.** Share of contested rival rows where each feature separates rival from target
+(rival better / target better):
+
+| scenario | exact | loose | position | popularity | velocity | tags | bm25 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| buying | 0.0 / 18.3 | 0.1 / 4.9 | 7.8 / 14.3 | 9.6 / 90.3 | 8.0 / 91.9 | 0 / 0 | 86.2 / 13.8 |
+| browsing | 0.0 / 44.0 | 0.1 / 0.6 | 0.3 / 1.4 | 6.9 / 93.0 | 7.1 / 92.8 | 0 / 0 | 93.0 / 7.0 |
+| intent_override | 0.0 / 29.2 | 0.5 / 1.2 | 0.5 / 6.5 | 15.0 / 85.0 | 18.6 / 81.4 | 0 / 0 | 87.0 / 13.0 |
+| boundary | 0.0 / 28.2 | 0.3 / 1.1 | 0.3 / 1.9 | 4.3 / 95.7 | 5.6 / 94.4 | 0 / 0 | 97.0 / 3.0 |
+
+`exact` is never worse for the target on any contested row in any scenario — it can only
+help, which is why it is the tuner's scale anchor. `loose` and `position` separate almost
+nothing outside Buying, so their global weight is free to serve the sessions that do use
+them. Routing can only pay where two scenarios want *opposite* values of a feature live
+in both, and the ones live everywhere — `popularity`, `velocity`, `bm25` — are already
+tie-breaks (§3). `tags` is identically zero everywhere because §8 shipped it off; the
+search still assigned it 3.267 for Buying on salt b, which is the overfitting visible in
+a coordinate that provably cannot matter.
+
+**Separately, the label is not observable.** The agent is never told `scenario_type`; it
+infers intent from the simulator's templated opening (§1), Override is not knowable until
+turn 3–4 and Boundary not until the shrug. The spec reserves the right to paraphrase
+those messages, so a weight table keyed on that inference would multiply the exposure of
+a parse that is already template-locked.
 
 ## Tooling built along the way
 
