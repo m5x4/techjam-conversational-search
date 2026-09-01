@@ -156,7 +156,9 @@ python -m evaluator.local_evaluator
 # writes results.json  ->  recommended_technical_score = 0.967579
 ```
 
-**Held-out dev set (800) — our generalisation check:**
+`TechnicalScore` is an objective input to the `Technical Execution` assessment. It is not a separate judging criterion and does not represent the entire `Technical Execution` score.
+
+Only exact `parent_asin` equality produces a hit. Core metrics are also reported by scenario.
 
 ```bash
 python -m evaluator.local_evaluator --dataset data/dev_set.jsonl --output results.dev.json
@@ -178,7 +180,10 @@ python -m unittest discover -s tests
 Numbers are reproducible bit-for-bit: the agent makes no random draws, no
 network calls, and no model calls.
 
-## Repository Layout
+- Participant submission requirements: `docs/submission_rules.md`
+- Organizer-only final judging controls: `organizer/JUDGING_RUNBOOK.md`
+- Organizer private release checklist: `organizer/private_release_checklist.md`
+- Judging day operations SOP: `organizer/JUDGING_DAY_SOP.md`
 
 ```text
 starter/agent.py                 Submission entry point — the scenario router
